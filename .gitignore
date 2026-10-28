@@ -1,0 +1,12 @@
+data/
+out/
+.venv/
+__pycache__/
+*.wav
+.pytest_cache/
+*.aiff
+# 个人数据：设置、自己的专有名词表（仓库里提供 vocab.example.txt）
+config/settings.json
+config/vocab.txt
+# 内部交接文档，含本机路径
+docs/*交接*

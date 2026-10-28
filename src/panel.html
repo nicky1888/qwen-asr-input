@@ -1,0 +1,350 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>语音输入</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #e9ecf4; --card: #ffffff; --ink: #161822; --sub: #6f7488; --line: rgba(22,24,34,.08);
+  --accent: #5b5ce2; --accent2: #a55cf2; --soft: #ededff;
+  --ok: #28a85f; --rec: #e5484d; --busy: #e09312; --idle: #9aa0b4;
+  --okbg: #e0f5e8; --recbg: #fde7e8; --busybg: #fbeed3; --idlebg: #eceef4;
+  --glow: rgba(91,92,226,.30);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0e1017; --card: #191c28; --ink: #f0f1f8; --sub: #8a8fa5; --line: rgba(255,255,255,.09);
+    --accent: #8585ff; --accent2: #c084ff; --soft: #252849;
+    --ok: #45d183; --rec: #ff7075; --busy: #ffb648; --idle: #7b8199;
+    --okbg: #14301f; --recbg: #3a1c20; --busybg: #37290f; --idlebg: #222636;
+    --glow: rgba(133,133,255,.25);
+  }
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body {
+  background: var(--bg); color: var(--ink); -webkit-user-select: none; user-select: none;
+  font: 14px/1.55 -apple-system, BlinkMacSystemFont, "SF Pro Text", "PingFang SC", "Hiragino Sans GB", sans-serif; -webkit-font-smoothing: antialiased;
+}
+textarea, input { -webkit-user-select: text; user-select: text; }
+.top { display: flex; align-items: center; justify-content: space-between; padding: 18px 24px 12px; }
+.brand { display: flex; align-items: center; gap: 11px; }
+.logo { width: 36px; height: 36px; border-radius: 12px; background: linear-gradient(135deg, var(--accent), var(--accent2));
+  display: grid; place-items: center; color: #fff; box-shadow: 0 4px 12px var(--glow); }
+.logo svg { width: 19px; height: 19px; }
+.brand .logo { color: #fff; }  /* 压过 .brand span 的灰色 */
+.brand b { display: block; font-size: 15.5px; font-weight: 600; letter-spacing: -.01em; }
+.brand span { font-size: 11px; color: var(--sub); font-weight: 600; }
+.tabs { display: flex; background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 4px; gap: 2px; }
+.tab { border: 0; background: none; font: inherit; font-weight: 500; font-size: 12.5px; color: var(--sub);
+  padding: 6px 15px; border-radius: 999px; cursor: default; transition: background-color .18s, color .18s; }
+.tab.on { background: var(--accent); color: #fff; }
+.wrap { max-width: 640px; margin: 0 auto; padding: 4px 24px 40px; }
+.card { background: var(--card); border: 1px solid var(--line); border-radius: 22px; padding: 20px; margin-bottom: 14px; }
+.card h2 { font-size: 12px; font-weight: 600; color: var(--sub); letter-spacing: .1em; margin: 0 0 14px; }
+.hero { display: flex; align-items: center; gap: 15px; }
+.dot { width: 44px; height: 44px; border-radius: 15px; background: var(--idlebg); color: var(--idle);
+  flex: none; display: grid; place-items: center; transition: background-color .25s, color .25s; }
+.dot svg { width: 22px; height: 22px; }
+.dot.ready { background: var(--okbg); color: var(--ok); }
+.dot.recording { background: var(--recbg); color: var(--rec); animation: pulse 1.2s infinite; }
+.dot.transcribing, .dot.loading { background: var(--busybg); color: var(--busy); }
+.dot.error { background: var(--recbg); color: var(--rec); }
+@keyframes pulse { 50% { opacity: .45; } }
+.state { font-size: 19px; font-weight: 600; letter-spacing: -.01em; }
+.detail { color: var(--sub); font-size: 12.5px; min-height: 18px; margin-top: 1px; }
+.chips { display: flex; gap: 10px; margin-top: 16px; }
+.chip { flex: 1; min-width: 0; background: var(--bg); border-radius: 16px; padding: 11px 13px; }
+.chip .k { font-size: 11px; color: var(--sub); font-weight: 500; }
+.chip .v { font-size: 15px; font-weight: 600; margin-top: 3px; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.chip .s { font-size: 10.5px; color: var(--sub); margin-top: 2px; }
+.stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.col { background: var(--bg); border-radius: 16px; padding: 13px 15px; }
+.col h3 { margin: 0 0 8px; font-size: 12px; font-weight: 600; color: var(--accent); }
+.row { display: flex; justify-content: space-between; padding: 4.5px 0; font-size: 12.5px; }
+.row span { color: var(--sub); }
+.row b { font-weight: 600; font-variant-numeric: tabular-nums; }
+.note { color: var(--sub); font-size: 11.5px; line-height: 1.65; margin: 14px 0 0; }
+.btn { border: 0; border-radius: 999px; padding: 9px 20px; font: inherit; font-weight: 600; font-size: 13px;
+  background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #fff; cursor: default;
+  transition: filter .15s, opacity .15s; box-shadow: 0 4px 14px var(--glow); }
+.btn.ghost { background: var(--soft); color: var(--accent); box-shadow: none; }
+.btn:disabled { opacity: .4; box-shadow: none; }
+.btn:active:not(:disabled) { filter: brightness(.94); }
+.field { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 14px 0; border-top: 1px solid var(--line); }
+.field:first-of-type { border-top: 0; padding-top: 0; }
+.field .name { font-weight: 600; font-size: 13.5px; }
+.field .hint { color: var(--sub); font-size: 11.5px; margin-top: 3px; line-height: 1.6; max-width: 350px; }
+.field .ctl { display: flex; align-items: center; gap: 9px; flex: none; color: var(--sub); font-size: 12.5px; font-weight: 500; }
+input[type=number] { width: 78px; background: var(--bg); color: var(--ink); border: 1px solid var(--line);
+  border-radius: 12px; padding: 8px 10px; font: inherit; font-weight: 600; text-align: right; font-variant-numeric: tabular-nums; }
+input:focus, textarea:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+.keycap { background: var(--bg); border: 1px solid var(--line); border-radius: 12px; padding: 7px 13px;
+  font-weight: 600; font-variant-numeric: tabular-nums; }
+textarea { width: 100%; height: 300px; min-height: 180px; resize: vertical; background: var(--bg); color: var(--ink);
+  border: 1px solid var(--line); border-radius: 16px; padding: 13px 15px; font: 13px/1.8 ui-monospace, "SF Mono", Menlo, monospace; }
+.switch { position: relative; width: 44px; height: 26px; flex: none; }
+.switch input { position: absolute; opacity: 0; width: 100%; height: 100%; margin: 0; }
+.switch span { position: absolute; inset: 0; background: var(--idlebg); border: 1px solid var(--line); border-radius: 999px; transition: background-color .18s; pointer-events: none; }
+.switch span::after { content: ""; position: absolute; top: 2px; left: 2px; width: 20px; height: 20px; border-radius: 50%;
+  background: #fff; box-shadow: 0 1px 3px rgba(0,0,0,.25); transition: transform .18s; }
+.switch input:checked + span { background: linear-gradient(135deg, var(--accent), var(--accent2)); }
+.switch input:checked + span::after { transform: translateX(18px); }
+.seg { display: flex; background: var(--bg); border: 1px solid var(--line); border-radius: 999px; padding: 3px; gap: 2px; }
+.seg button { border: 0; background: none; font: inherit; font-weight: 500; font-size: 12.5px; color: var(--sub);
+  padding: 5px 14px; border-radius: 999px; cursor: default; transition: background-color .18s, color .18s; }
+.seg button.on { background: var(--accent); color: #fff; }
+.actions { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+section { display: none; }
+section.on { display: block; animation: in .2s ease; }
+@keyframes in { from { opacity: 0; transform: translateY(4px); } }
+#toast { position: fixed; left: 50%; bottom: 22px; transform: translate(-50%, 18px) scale(.96); opacity: 0; pointer-events: none;
+  background: var(--ink); color: var(--bg); padding: 9px 18px; border-radius: 999px; font-size: 12.5px; font-weight: 500;
+  transition: .2s; box-shadow: 0 8px 24px rgba(0,0,0,.22); }
+#toast.show { opacity: 1; transform: translate(-50%, 0) scale(1); }
+#toast.bad { background: var(--rec); color: #fff; }
+@media (max-width: 660px) {
+  .chips { flex-direction: column; }
+  .stats { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <span class="logo">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="9" y="2.5" width="6" height="11.5" rx="3"/><path d="M5 11.5a7 7 0 0 0 14 0"/><path d="M12 18.5v3"/></svg>
+    </span>
+    <div><b data-i18n="app">语音输入</b><span data-i18n="sub">Qwen3-ASR · 本地识别</span></div>
+  </div>
+  <nav class="tabs">
+    <button class="tab on" data-tab="home" data-i18n="tabHome">首页</button>
+    <button class="tab" data-tab="settings" data-i18n="tabSettings">设置</button>
+    <button class="tab" data-tab="vocab" data-i18n="tabVocab">词表</button>
+  </nav>
+</header>
+
+<div class="wrap">
+  <section id="home" class="on">
+    <div class="card">
+      <div class="hero">
+        <span class="dot" id="dot">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M4 10v4M8 7v10M12 4v16M16 7v10M20 10v4"/></svg>
+        </span>
+        <div>
+          <div class="state" id="state" data-i18n="connecting">连接中…</div>
+          <div class="detail" id="detail"></div>
+        </div>
+      </div>
+      <div class="chips">
+        <div class="chip"><div class="k" data-i18n="hotkey">快捷键</div><div class="v" id="hotkey">—</div></div>
+        <div class="chip"><div class="k" data-i18n="model">模型</div><div class="v" id="model">—</div><div class="s" id="modelNote"></div></div>
+        <div class="chip"><div class="k" data-i18n="mem">内存占用</div><div class="v" id="mem">—</div><div class="s" data-i18n="memNote">含模型占的显存</div></div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2 data-i18n="usage">用量</h2>
+      <div class="stats">
+        <div class="col"><h3 data-i18n="today">今日</h3><div id="statToday"></div></div>
+        <div class="col"><h3 data-i18n="total">累计</h3><div id="statTotal"></div></div>
+      </div>
+      <p class="note" data-i18n="usageNote">省时是估算：按每分钟打 40 字算出打字要多久，再减去说话花的时间。数据来自日志里的次数、时长、字数，不含口述内容。</p>
+    </div>
+
+    <button class="btn" id="copyLast" disabled data-i18n="copyLast">复制上次结果</button>
+  </section>
+
+  <section id="settings">
+    <div class="card">
+      <div class="field">
+        <div><div class="name" data-i18n="hotkey">快捷键</div><div class="hint" data-i18n="hotkeyHint">点「更改」后按下新的组合键</div></div>
+        <div class="ctl"><span class="keycap" id="hotkey2">—</span><button class="btn ghost" id="changeHotkey" data-i18n="change">更改…</button></div>
+      </div>
+      <div class="field">
+        <div><div class="name" data-i18n="idle">闲置卸载模型</div><div class="hint" data-i18n="idleHint">闲置这么久后卸下模型省内存，下次按快捷键自动重载。0 为常驻</div></div>
+        <div class="ctl"><input type="number" id="idle" min="0" max="1440" step="1"><span data-i18n="min">分钟</span></div>
+      </div>
+      <div class="field">
+        <div><div class="name" data-i18n="maxRec">单次录音上限</div><div class="hint" data-i18n="maxRecHint">到时自动结束并识别（10–600 秒）</div></div>
+        <div class="ctl"><input type="number" id="maxSec" min="10" max="600" step="10"><span data-i18n="sec">秒</span></div>
+      </div>
+      <div class="actions"><button class="btn" id="saveSettings" data-i18n="saveSettings">保存设置</button></div>
+    </div>
+    <div class="card">
+      <div class="field">
+        <div><div class="name" data-i18n="cleanup">清理语气词</div><div class="hint" data-i18n="cleanupHint">识别后删掉嗯、呃、单独的啊和明显重复的词，不改写句子</div></div>
+        <div class="ctl"><label class="switch"><input type="checkbox" id="cleanup"><span></span></label></div>
+      </div>
+      <div class="field">
+        <div><div class="name" data-i18n="digits">数字用阿拉伯数字</div><div class="hint" data-i18n="digitsHint">百分之十二点五 → 12.5%，一千二百美元 → 1200美元；「一起」「十分」「七八个」这类保持汉字</div></div>
+        <div class="ctl"><label class="switch"><input type="checkbox" id="digits"><span></span></label></div>
+      </div>
+      <div class="field">
+        <div><div class="name" data-i18n="lang">界面语言</div><div class="hint" data-i18n="langHint">面板、菜单栏和提示都会切换，立即生效</div></div>
+        <div class="ctl"><div class="seg" id="langSeg"><button data-lang="zh">中文</button><button data-lang="en">English</button></div></div>
+      </div>
+    </div>
+  </section>
+
+  <section id="vocab">
+    <div class="card">
+      <h2 data-i18n="vocabTitle">专有名词表</h2>
+      <textarea id="vocabText" spellcheck="false" data-i18n-ph="vocabPh" placeholder="一行一个词，# 开头是注释"></textarea>
+      <div class="actions">
+        <button class="btn" id="saveVocab" data-i18n="saveVocab">保存词表</button>
+        <span class="note" style="margin:0" data-i18n="vocabNote">一行一个，作为识别上下文；保存后下一次识别生效。只放常被认错的词。</span>
+      </div>
+    </div>
+  </section>
+</div>
+<div id="toast"></div>
+
+<script>
+const $ = id => document.getElementById(id);
+const T = {
+  zh: {app: "语音输入", sub: "Qwen3-ASR · 本地识别", tabHome: "首页", tabSettings: "设置", tabVocab: "词表",
+       connecting: "连接中…", hotkey: "快捷键", model: "模型", mem: "内存占用", memNote: "含模型占的显存",
+       usage: "用量", today: "今日", total: "累计",
+       usageNote: "省时是估算：按每分钟打 40 字算出打字要多久，再减去说话花的时间。数据来自日志里的次数、时长、字数，不含口述内容。",
+       copyLast: "复制上次结果", hotkeyHint: "点「更改」后按下新的组合键", change: "更改…",
+       idle: "闲置卸载模型", idleHint: "闲置这么久后卸下模型省内存，下次按快捷键自动重载。0 为常驻", min: "分钟",
+       maxRec: "单次录音上限", maxRecHint: "到时自动结束并识别（10–600 秒）", sec: "秒", saveSettings: "保存设置",
+       cleanup: "清理语气词", cleanupHint: "识别后删掉嗯、呃、单独的啊和明显重复的词，不改写句子",
+       digits: "数字用阿拉伯数字", digitsHint: "百分之十二点五 → 12.5%，一千二百美元 → 1200美元；「一起」「十分」「七八个」这类保持汉字",
+       lang: "界面语言", langHint: "面板、菜单栏和提示都会切换，立即生效",
+       vocabTitle: "专有名词表", vocabPh: "一行一个词，# 开头是注释", saveVocab: "保存词表",
+       vocabNote: "一行一个，作为识别上下文；保存后下一次识别生效。只放常被认错的词。",
+       preview: "预览模式 · 未连接后端",
+       states: {loading: "加载模型中", ready: "就绪", recording: "录音中", transcribing: "识别中", error: "出错了"},
+       models: {loaded: ["已加载", ""], loading: ["加载中", ""], unloaded: ["已闲置卸下", "下次按快捷键自动重载"]},
+       rows: ["次数", "字数", "口述时长", "省时（估算）"],
+       count: n => `${n} 次`, chars: n => `${n.toLocaleString()} 字`,
+       dur: (h, m, s) => h ? `${h} 小时 ${m} 分` : m ? `${m} 分 ${s} 秒` : `${s} 秒`,
+       saved: m => m < 60 ? `约 ${m} 分钟` : `约 ${(m / 60).toFixed(1)} 小时`},
+  en: {app: "Voice Input", sub: "Qwen3-ASR · on-device", tabHome: "Home", tabSettings: "Settings", tabVocab: "Vocabulary",
+       connecting: "Connecting…", hotkey: "Hotkey", model: "Model", mem: "Memory", memNote: "incl. GPU memory",
+       usage: "Usage", today: "Today", total: "All time",
+       usageNote: "Time saved is an estimate: typing time at 40 characters per minute, minus the time spent speaking. Counts, durations and character totals come from the log; what you said is never stored.",
+       copyLast: "Copy last result", hotkeyHint: "Click Change, then press the new key combination", change: "Change…",
+       idle: "Unload model when idle", idleHint: "Frees memory after this long; the next hotkey press reloads it. 0 keeps it loaded", min: "min",
+       maxRec: "Max recording length", maxRecHint: "Stops and transcribes automatically (10–600 s)", sec: "s", saveSettings: "Save settings",
+       cleanup: "Remove filler words", cleanupHint: "Drops 嗯 / 呃 / um / uh, stray 啊 and obvious repeats. Sentences are never rewritten",
+       digits: "Use Arabic numerals", digitsHint: "百分之十二点五 → 12.5%, 一千二百美元 → 1200美元; idioms like 一起, 十分, 七八个 stay as characters",
+       lang: "Language", langHint: "Applies to this panel, the menu bar and notices, right away",
+       vocabTitle: "Custom vocabulary", vocabPh: "One term per line, # starts a comment", saveVocab: "Save vocabulary",
+       vocabNote: "One per line, used as recognition context from the next transcription. Only add words that get misheard.",
+       preview: "Preview mode · not connected",
+       states: {loading: "Loading model", ready: "Ready", recording: "Recording", transcribing: "Transcribing", error: "Error"},
+       models: {loaded: ["Loaded", ""], loading: ["Loading", ""], unloaded: ["Unloaded (idle)", "Reloads on next hotkey press"]},
+       rows: ["Sessions", "Characters", "Speaking time", "Time saved (est.)"],
+       count: n => `${n}`, chars: n => n.toLocaleString(),
+       dur: (h, m, s) => h ? `${h} h ${m} min` : m ? `${m} min ${s} s` : `${s} s`,
+       saved: m => m < 60 ? `~${m} min` : `~${(m / 60).toFixed(1)} h`},
+};
+let lang = "zh", last = null;
+const t = k => T[lang][k];
+function applyLang(l) {
+  lang = T[l] ? l : "zh";
+  document.documentElement.lang = lang === "en" ? "en" : "zh-CN";
+  document.title = t("app");
+  document.querySelectorAll("[data-i18n]").forEach(el => { el.textContent = t(el.dataset.i18n); });
+  document.querySelectorAll("[data-i18n-ph]").forEach(el => { el.placeholder = t(el.dataset.i18nPh); });
+  document.querySelectorAll("#langSeg button").forEach(b => b.classList.toggle("on", b.dataset.lang === lang));
+}
+let settingsDirty = false, vocabDirty = false, toastTimer = null;
+const DEMO = !(window.webkit && window.webkit.messageHandlers && window.webkit.messageHandlers.panel);
+
+// 发给 Python：一律 JSON 字符串；预览模式下只弹本地提示，不外发
+function send(type, extra) {
+  if (DEMO) {
+    if (type === "set_language") { applyLang(extra.lang); if (last) panel.update(last); return; }
+    if (type !== "refresh" && type !== "get_vocab") panel.toast({ok: true, kind: "", msg: t("preview")});
+    return;
+  }
+  try { window.webkit.messageHandlers.panel.postMessage(JSON.stringify({type, ...extra})); } catch (e) {}
+}
+
+function fmtDuration(s) {
+  s = Math.round(s);
+  const m = Math.floor(s / 60);
+  return t("dur")(Math.floor(m / 60), m < 60 ? m : m % 60, s % 60);
+}
+function fmtMinutes(m) { return t("saved")(Math.round(m * 10) / 10); }
+function fmtMem(mb) { return mb == null ? "—" : mb >= 1024 ? (mb / 1024).toFixed(1) + " GB" : Math.round(mb) + " MB"; }
+
+function statRows(s) {
+  const vals = [t("count")(s.count), t("chars")(s.chars), fmtDuration(s.audio_s), fmtMinutes(s.saved_min)];
+  return t("rows").map((k, i) => `<div class="row"><span>${k}</span><b>${vals[i]}</b></div>`).join("");
+}
+
+
+window.panel = {
+  update(s) {
+    last = s;
+    if (s.lang && s.lang !== lang) applyLang(s.lang);
+    $("dot").className = "dot " + s.state;
+    $("state").textContent = t("states")[s.state] || s.state;
+    $("detail").textContent = s.detail || "";
+    $("hotkey").textContent = $("hotkey2").textContent = s.hotkey;
+    const [m, note] = t("models")[s.model] || ["—", ""];
+    $("model").textContent = m; $("modelNote").textContent = note;
+    this.setMem(s.mem_mb);
+    if (s.stats) { $("statToday").innerHTML = statRows(s.stats.today); $("statTotal").innerHTML = statRows(s.stats.total); }
+    $("copyLast").disabled = !s.has_last;
+    if (typeof s.cleanup === "boolean") $("cleanup").checked = s.cleanup;
+    if (typeof s.digits === "boolean") $("digits").checked = s.digits;
+    if (!settingsDirty) { $("idle").value = s.idle_unload_minutes; $("maxSec").value = s.max_seconds; }
+  },
+  setMem(mb) { $("mem").textContent = fmtMem(mb); },
+  setVocab(text) { if (!vocabDirty) $("vocabText").value = text; },
+  toast({ok, msg, kind}) {
+    const t = $("toast");
+    t.textContent = msg; t.className = "show" + (ok ? "" : " bad");
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => { t.className = ""; }, 2200);
+    if (ok && kind === "settings") settingsDirty = false;
+    if (ok && kind === "vocab") vocabDirty = false;
+  },
+};
+
+document.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === b));
+  document.querySelectorAll("section").forEach(x => x.classList.toggle("on", x.id === b.dataset.tab));
+  if (b.dataset.tab === "home") send("refresh");
+  if (b.dataset.tab === "vocab" && !vocabDirty) send("get_vocab");
+}));
+$("copyLast").addEventListener("click", () => send("copy_last"));
+$("changeHotkey").addEventListener("click", () => send("change_hotkey"));
+$("saveSettings").addEventListener("click", () =>
+  send("save_settings", {idle_unload_minutes: $("idle").value, max_seconds: $("maxSec").value}));
+$("saveVocab").addEventListener("click", () => send("save_vocab", {text: $("vocabText").value}));
+["idle", "maxSec"].forEach(id => $(id).addEventListener("input", () => { settingsDirty = true; }));
+$("vocabText").addEventListener("input", () => { vocabDirty = true; });
+document.querySelectorAll("#langSeg button").forEach(b => b.addEventListener("click", () => {
+  if (b.dataset.lang !== lang) send("set_language", {lang: b.dataset.lang});
+}));
+$("cleanup").addEventListener("change", e => send("set_cleanup", {on: e.target.checked}));
+$("digits").addEventListener("change", e => send("set_digits", {on: e.target.checked}));
+applyLang("zh");
+
+if (DEMO) {
+  // 浏览器预览用的演示数据；接入 webkit 后一律不出现
+  panel.update({
+    state: "ready", detail: "模型就绪 · 按 fn A 开始录音", hotkey: "fn A", model: "loaded",
+    mem_mb: 2560, has_last: true, cleanup: true, digits: true, idle_unload_minutes: 5, max_seconds: 180,
+    stats: {
+      today: {count: 4, chars: 463, audio_s: 73, saved_min: 463 / 40 - 73 / 60},
+      total: {count: 128, chars: 15230, audio_s: 2410, saved_min: 15230 / 40 - 2410 / 60},
+    },
+  });
+  panel.setVocab("# 一行一个词，# 开头是注释\nPyTorch\nQwen3-ASR\ncaffeinate\nbootstrap\n回测");
+} else {
+  send("refresh");
+  send("get_vocab");
+}
+</script>
+</body>
+</html>

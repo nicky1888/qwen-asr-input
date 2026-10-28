@@ -1,0 +1,31 @@
+#!/bin/zsh
+# 用法：voice-input start|stop|status|run [--max-seconds ...]
+set -u
+ROOT=${0:A:h:h}
+PY=$ROOT/.venv/bin/python
+PIDFILE=$HOME/Library/Caches/qwen-asr-input.pid
+LOG=$HOME/Library/Logs/qwen-asr-input.log
+APP="$HOME/Applications/语音输入.app"
+running() { [[ -f $PIDFILE ]] && kill -0 $(<$PIDFILE) 2>/dev/null }
+cmd=${1:-status}; shift 2>/dev/null
+case $cmd in
+  run)   exec $PY $ROOT/src/voice_input.py "$@" ;;  # 前台调试，权限算在当前终端名下
+  start)
+    if running; then echo "已在运行 pid=$(<$PIDFILE)"; exit 0; fi
+    [[ -d $APP ]] || { echo "没找到 $APP，先跑 scripts/build-app.sh"; exit 1; }
+    open "$APP"
+    echo "已启动，菜单栏 ⏳ 变 🎙 即就绪（约 10 秒）。日志：$LOG" ;;
+  stop)
+    if ! running; then echo "没在运行"; rm -f $PIDFILE; exit 0; fi
+    pid=$(<$PIDFILE); kill $pid
+    for i in {1..50}; do kill -0 $pid 2>/dev/null || break; sleep 0.1; done
+    kill -0 $pid 2>/dev/null && { kill -9 $pid; echo "强制结束 pid=$pid"; } || echo "已退出 pid=$pid"
+    rm -f $PIDFILE ;;
+  status)
+    if running; then
+      pid=$(<$PIDFILE)
+      echo "运行中 pid=$pid  内存占用 $(footprint -p $pid 2>/dev/null | awk '/Footprint:/{print $(NF-5), $(NF-4); exit}')"
+      grep -E 'state=|notice:|deliver' $LOG | tail -3
+    else echo "没在运行"; fi ;;
+  *) echo "用法：voice-input start|stop|status|run"; exit 2 ;;
+esac

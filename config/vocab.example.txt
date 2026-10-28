@@ -1,0 +1,8 @@
+# 专有名词表示例。复制成 config/vocab.txt 再改：cp config/vocab.example.txt config/vocab.txt
+# 一行一个词，作为识别上下文提示模型；改完下一次识别就生效，不用重启。
+# 只放常被认错的词，词太多会稀释效果（未测上限）。
+GitHub
+PyTorch
+Claude Code
+launchd
+caffeinate
