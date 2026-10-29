@@ -8,6 +8,8 @@ import ctypes
 import json
 import logging
 import os
+import struct
+import subprocess
 import threading
 import time
 from pathlib import Path
@@ -24,24 +26,22 @@ from ApplicationServices import (
     AXUIElementCreateApplication, AXUIElementIsAttributeSettable,
     AXUIElementSetAttributeValue, kAXTrustedCheckOptionPrompt,
 )
-from CoreFoundation import (
-    CFEqual, CFMachPortCreateRunLoopSource, CFRunLoopAddSource, CFRunLoopGetCurrent, CFRunLoopRun,
-    kCFRunLoopCommonModes,
+from CoreFoundation import CFEqual
+from Foundation import (
+    NSActivityUserInitiatedAllowingIdleSystemSleep, NSBundle, NSDistributedNotificationCenter, NSObject, NSProcessInfo,
 )
-from Foundation import NSBundle, NSDistributedNotificationCenter, NSObject
 from PyObjCTools import AppHelper
 from Quartz import (
-    CGEventCreateKeyboardEvent, CGEventGetFlags, CGEventGetIntegerValueField, CGEventMaskBit, CGEventPost,
-    CGEventSetFlags, CGEventTapCreate, CGEventTapEnable, kCGEventFlagMaskAlternate, kCGEventFlagMaskCommand,
-    kCGEventFlagMaskControl, kCGEventFlagMaskSecondaryFn, kCGEventFlagMaskShift, kCGEventKeyDown, kCGEventKeyUp,
-    kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput, kCGEventTapOptionDefault, kCGHIDEventTap,
-    kCGHeadInsertEventTap, kCGKeyboardEventAutorepeat, kCGKeyboardEventKeycode, kCGSessionEventTap,
+    CGEventCreateKeyboardEvent, CGEventPost, CGEventSetFlags, kCGEventFlagMaskAlternate, kCGEventFlagMaskCommand,
+    kCGEventFlagMaskControl, kCGEventFlagMaskSecondaryFn, kCGEventFlagMaskShift, kCGEventTapDisabledByTimeout,
+    kCGHIDEventTap,
 )
 
 import i18n
 from cleanup import clean
 from cn_numbers import to_digits
 from i18n import tr
+from overlay import Overlay
 from panel import Panel
 from stats import parse_log_stats
 
@@ -117,6 +117,10 @@ KEYCODES = {  # macOS 虚拟键码（ANSI 布局）
 KEY_NAMES = {code: name for name, code in KEYCODES.items()}
 FKEY_CODES = {code for name, code in KEYCODES.items() if name[0] == "f" and name[1:].isdigit()}
 ESC = 53
+KEYTAP_SRC = Path(__file__).resolve().parent / "keytap.c"
+KEYTAP_LIB = ROOT / "out/libkeytap.dylib"
+TAP_RECORD = struct.Struct("<IIQ")  # 和 keytap.c 的 Record 一致：事件类型、键码、修饰键标记
+TAP_TOGGLE, TAP_CANCEL, TAP_CAPTURE, TAP_REENABLED = 1, 2, 3, 4
 MOD_ORDER = [("fn", "fn ", kCGEventFlagMaskSecondaryFn), ("ctrl", "⌃", kCGEventFlagMaskControl),
              ("alt", "⌥", kCGEventFlagMaskAlternate), ("shift", "⇧", kCGEventFlagMaskShift),
              ("cmd", "⌘", kCGEventFlagMaskCommand)]
@@ -174,56 +178,61 @@ def resolve_max_seconds(cli_value):
     return cli_value if cli_value is not None else float(load_setting("max_seconds", DEFAULT_MAX_SECONDS))
 
 
+def mods_mask(mods):
+    return sum(mask for name, _, mask in MOD_ORDER if name in mods)
+
+
+def load_keytap_lib():
+    """按需编译 keytap.c（源码比产物新才编），返回加载好的库。"""
+    if not KEYTAP_LIB.exists() or KEYTAP_LIB.stat().st_mtime < KEYTAP_SRC.stat().st_mtime:
+        KEYTAP_LIB.parent.mkdir(exist_ok=True)
+        subprocess.run(["clang", "-O2", "-Wall", "-dynamiclib", "-framework", "ApplicationServices",
+                        "-o", str(KEYTAP_LIB), str(KEYTAP_SRC)], check=True, capture_output=True)
+    lib = ctypes.CDLL(str(KEYTAP_LIB))
+    lib.kt_handle.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_uint64, ctypes.c_int]
+    lib.kt_set_hotkey.argtypes = [ctypes.c_int64, ctypes.c_uint64]
+    return lib
+
+
 class KeyTap:
-    """全局键盘监听，跑在独立线程上。
+    """全局键盘监听。按键判断和吞键在 keytap.c 的原生线程里做，按键路径上不碰 Python；
+    命中的事件写进管道，这里的读线程收到后调 on_event(kind, keycode, flags)。"""
 
-    挂主线程时，主线程一忙（开麦、读 Brave 焦点曾卡 1 秒多）系统就判监听超时并停掉它，
-    期间的 Esc 会丢。on_key(keycode, flags, is_repeat) 在监听线程里调用，返回 True 吞掉这次按键（连同抬起）。
-    """
+    def __init__(self, on_event):
+        self.on_event = on_event
+        self.lib = None
 
-    def __init__(self, on_key):
-        self.on_key = on_key
-        self.tap = None
-        self.swallowed = set()
-
-    def start(self):
-        ready = threading.Event()
-        threading.Thread(target=self.run, args=(ready,), daemon=True, name="keytap").start()
-        ready.wait()
-        if self.tap is None:
+    def start(self, hotkey):
+        self.lib = load_keytap_lib()
+        r, w = os.pipe()
+        os.set_blocking(w, False)
+        self.lib.kt_set_output(w)
+        self.set_hotkey(hotkey)
+        if self.lib.kt_start() != 0:
             raise RuntimeError(tr("开不了键盘监听，快捷键不可用：缺辅助功能权限",
                                   "Can't listen to the keyboard, hotkey disabled: Accessibility permission missing"))
+        threading.Thread(target=self.read_events, args=(r,), daemon=True, name="keytap").start()
 
-    def run(self, ready):
-        mask = CGEventMaskBit(kCGEventKeyDown) | CGEventMaskBit(kCGEventKeyUp)
-        self.tap = CGEventTapCreate(kCGSessionEventTap, kCGHeadInsertEventTap, kCGEventTapOptionDefault,
-                                    mask, self.callback, None)
-        ready.set()
-        if self.tap is None:
-            return
-        CFRunLoopAddSource(CFRunLoopGetCurrent(), CFMachPortCreateRunLoopSource(None, self.tap, 0), kCFRunLoopCommonModes)
-        CGEventTapEnable(self.tap, True)
-        CFRunLoopRun()
+    def read_events(self, fd):
+        while True:
+            data = os.read(fd, TAP_RECORD.size * 64)  # 原生侧每条一次 write，读到的总是整条
+            for kind, code, flags in TAP_RECORD.iter_unpack(data):
+                try:
+                    self.on_event(kind, code, flags)
+                except Exception:
+                    log.exception("处理键盘事件出错")
 
-    def callback(self, proxy, etype, event, refcon):
-        try:
-            if etype in (kCGEventTapDisabledByTimeout, kCGEventTapDisabledByUserInput):
-                CGEventTapEnable(self.tap, True)
-                log.info("键盘监听被系统停用，已重新打开")
-                return event
-            code = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
-            if etype == kCGEventKeyUp:
-                if code in self.swallowed:
-                    self.swallowed.discard(code)
-                    return None
-                return event
-            repeat = bool(CGEventGetIntegerValueField(event, kCGKeyboardEventAutorepeat))
-            if self.on_key(code, CGEventGetFlags(event), repeat):
-                self.swallowed.add(code)
-                return None
-        except Exception:
-            log.exception("键盘监听回调出错，按键照常放行")  # 这里出错不能吞键，否则整台机器打不了字
-        return event
+    def set_hotkey(self, hotkey):
+        code, mods = hotkey
+        self.lib.kt_set_hotkey(code, mods_mask(mods))
+
+    def set_recording(self, on):
+        if self.lib is not None:
+            self.lib.kt_set_recording(int(on))
+
+    def set_capturing(self, on):
+        if self.lib is not None:
+            self.lib.kt_set_capturing(int(on))
 
 
 # ---------- 目标输入框 ----------
@@ -355,11 +364,13 @@ class MenuTarget(NSObject):
 
 class VoiceInput:
     panel = None
+    overlay = None
     stats = None  # 最近一次解析的日志统计，面板推送时复用
 
     def __init__(self, args):
         self.args = args
         self.panel = Panel(self)
+        self.overlay = Overlay()
         self.model = None
         self.model_ready = threading.Event()  # 置位＝没有加载在进行；加载或重载期间清掉
         self.idle_unload = float(load_setting("idle_unload_minutes", DEFAULT_IDLE_UNLOAD_MIN))
@@ -373,7 +384,7 @@ class VoiceInput:
         self.hotkey_spec = load_hotkey()
         self.hotkey = parse_hotkey(self.hotkey_spec)
         self.capturing = None  # 录制新快捷键时是收集结果的列表
-        self.keytap = KeyTap(self.on_key)
+        self.keytap = KeyTap(self.on_tap_event)
 
     # 界面
     def build_menu(self):
@@ -412,6 +423,11 @@ class VoiceInput:
         if detail is not None:
             self.detail_line.setTitle_(detail)
         log.info("state=%s %s", state, detail or "")
+        self.keytap.set_recording(state == "recording")
+        if self.overlay is not None and state in ("recording", "transcribing"):
+            self.overlay.show(state)
+        elif self.overlay is not None:
+            self.overlay.hide()
         if state == "ready":
             self.schedule_unload()
         self.push_panel(fresh_stats=state == "ready")
@@ -505,7 +521,7 @@ class VoiceInput:
                            "Accessibility permission missing: System Settings → Privacy & Security → Accessibility, "
                            "enable 语音输入, then reopen it from the Dock"))
         try:
-            self.keytap.start()
+            self.keytap.start(self.hotkey)
         except RuntimeError as e:
             self.notify(str(e))
         threading.Thread(target=self.load_model, daemon=True).start()
@@ -560,34 +576,32 @@ class VoiceInput:
                                      "digit or Space, or use an F key alone (F keys can't take fn). Esc cancels."))
         alert.addButtonWithTitle_(tr("取消", "Cancel")).setKeyEquivalent_("\x1b")
         self.capturing = []  # 录制期间键盘监听只收组合，不触发录音
+        self.keytap.set_capturing(True)
         NSApplication.sharedApplication().activateIgnoringOtherApps_(True)
         alert.runModal()
+        self.keytap.set_capturing(False)
         captured, self.capturing = self.capturing, None
         if not captured:
             return
         self.hotkey_spec, self.hotkey = captured[0], parse_hotkey(captured[0])
+        self.keytap.set_hotkey(self.hotkey)
         save_hotkey(captured[0])
         self.set_state(self.state, tr(f"快捷键已改为 {hotkey_label(captured[0])}", f"Hotkey changed to {hotkey_label(captured[0])}"))
 
-    def on_key(self, keycode, flags, repeat):
-        """在监听线程里跑：只做判断，动作都 callAfter 回主线程。返回 True 吞键。"""
-        combo = combo_from_event(keycode, flags)
-        if self.capturing is not None:
-            spec = spec_from_combo(*combo)
-            if spec is None:
-                return False  # Esc 等交给对话框
-            if not repeat and not self.capturing:
+    def on_tap_event(self, kind, keycode, flags):
+        """在 KeyTap 读线程里跑，吞不吞键原生侧已经定了；动作 callAfter 回主线程。"""
+        if kind == TAP_TOGGLE:
+            AppHelper.callAfter(self.on_toggle)
+        elif kind == TAP_CANCEL:
+            AppHelper.callAfter(self.cancel)
+        elif kind == TAP_CAPTURE and self.capturing is not None and not self.capturing:
+            spec = spec_from_combo(*combo_from_event(keycode, flags))
+            if spec is not None:  # 不支持的键（方向键等）原生侧也吞了，这里忽略，接着等
                 self.capturing.append(spec)
                 NSApplication.sharedApplication().abortModal()  # 文档允许从其他线程调用，stopModal 不行
-            return True
-        if combo == self.hotkey:
-            if not repeat:
-                AppHelper.callAfter(self.on_toggle)
-            return True
-        if keycode == ESC and not combo[1] and self.state == "recording":
-            AppHelper.callAfter(self.cancel)
-            return True
-        return False
+        elif kind == TAP_REENABLED:  # flags 里是停用原因
+            log.info("键盘监听被系统停用（%s），已重新打开",
+                     "回调超时" if flags == kCGEventTapDisabledByTimeout else "安全输入或权限变动")
 
     def quit(self):
         self.stop_stream()
@@ -612,7 +626,7 @@ class VoiceInput:
         NSSound.soundNamed_("Tink").play()  # 先响再开麦，免得提示音录进去
         try:
             self.stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32",
-                                         callback=lambda data, *_: self.chunks.append(data.copy()))
+                                         callback=self.on_audio)
             self.stream.start()
         except Exception as e:
             self.stream = None
@@ -625,6 +639,11 @@ class VoiceInput:
         AppHelper.callLater(self.args.max_seconds, lambda: self.session == session and self.state == "recording"
                             and self.finish_recording(timed_out=True))
         self.set_state("recording", tr(f"目标：{self.target['name']}", f"Target: {self.target['name']}"))
+
+    def on_audio(self, data, *_):
+        """录音线程里跑：存音频，顺手算音量给浮条画波形。"""
+        self.chunks.append(data.copy())
+        self.overlay.level = float(np.sqrt(np.mean(data * data)))
 
     def stop_stream(self):
         if self.stream is not None:
@@ -719,6 +738,9 @@ def main():
     NSBundle.mainBundle().infoDictionary()["CFBundleName"] = "语音输入"  # 面板在前台时菜单栏显示这个名字，而不是 python
     app = NSApplication.sharedApplication()
     app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)  # 无 Dock 图标，不抢焦点
+    # 关掉 App Nap：后台无窗口的进程会被系统降速，键盘监听线程跟着被拖，系统判超时停监听
+    activity = NSProcessInfo.processInfo().beginActivityWithOptions_reason_(  # 持有引用才生效，跟进程同寿
+        NSActivityUserInitiatedAllowingIdleSystemSleep, "global hotkey listener")
     voice = VoiceInput(args)
     voice.start()
     log.info("started pid=%d model=%s hotkey=%s", os.getpid(), args.model, voice.hotkey_spec)

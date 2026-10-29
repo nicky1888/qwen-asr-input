@@ -63,20 +63,68 @@ def test_spec_rejects_bare_keys():
     assert vi.spec_from_combo(*vi.combo_from_event(vi.ESC, 0)) is None  # Esc 留给取消
 
 
-def test_on_key_toggle_cancel_and_capture(monkeypatch):
+def tap_events(r):
+    os.set_blocking(r, False)
+    try:
+        return [k for k, _, _ in vi.TAP_RECORD.iter_unpack(os.read(r, 4096))]
+    except BlockingIOError:
+        return []
+
+
+def test_native_keytap_swallow_rules():
+    # 原生回调的判断逻辑，不开真监听：返回 1 表示吞键
+    lib = vi.load_keytap_lib()
+    r, w = os.pipe()
+    lib.kt_set_output(w)
+    lib.kt_set_hotkey(49, vi.mods_mask({"fn"}))
+    lib.kt_set_recording(0)
+    lib.kt_set_capturing(0)
+    assert lib.kt_handle(1, 49, FN, 0) == 1 and tap_events(r) == [vi.TAP_TOGGLE]
+    assert lib.kt_handle(1, 49, FN, 1) == 1 and tap_events(r) == []   # 按住连发不重复触发，但照样吞掉
+    assert lib.kt_handle(0, 49, FN, 0) == 1                                # 抬起跟着吞
+    assert lib.kt_handle(0, 49, FN, 0) == 0                                # 只吞一次
+    assert lib.kt_handle(1, 49, 0, 0) == 0                                 # 光按空格放行
+    assert lib.kt_handle(1, 49, FN | SHIFT, 0) == 0                        # 多一个修饰键不算
+    assert lib.kt_handle(1, vi.ESC, 0, 0) == 0                             # 没在录音，Esc 放行
+    lib.kt_set_recording(1)
+    assert lib.kt_handle(1, vi.ESC, 0, 0) == 1 and tap_events(r) == [vi.TAP_CANCEL]
+    lib.kt_set_hotkey(105, 0)                                              # 改成 F13
+    assert lib.kt_handle(1, 105, FN, 0) == 1                               # 系统给 F 键带的 fn 不影响匹配
+    tap_events(r)
+    lib.kt_set_capturing(1)
+    assert lib.kt_handle(1, vi.ESC, 0, 0) == 0                             # 录制时 Esc 交给对话框
+    assert lib.kt_handle(1, 9, 0, 0) == 0                                  # 光按字母放行
+    assert lib.kt_handle(1, 105, FN, 0) == 1                               # 录制时不触发录音，交给录制
+    assert lib.kt_handle(1, 9, FN | SHIFT, 0) == 1 and tap_events(r) == [vi.TAP_CAPTURE, vi.TAP_CAPTURE]
+    lib.kt_set_capturing(0)
+    os.close(r)
+    os.close(w)
+
+
+def test_on_tap_event_dispatch(monkeypatch):
     calls = []
     monkeypatch.setattr(vi.AppHelper, "callAfter", lambda f, *a: calls.append(f.__name__))
+    app = type("A", (), {"abortModal": lambda s: calls.append("abort")})()
+    monkeypatch.setattr(vi, "NSApplication", type("NSApp", (), {"sharedApplication": staticmethod(lambda: app)}))
     v = vi.VoiceInput.__new__(vi.VoiceInput)
-    v.hotkey_spec, v.hotkey, v.capturing, v.state = "fn+space", vi.parse_hotkey("fn+space"), None, "ready"
-    assert v.on_key(49, FN, False) and calls == ["on_toggle"]
-    assert v.on_key(49, FN, True) and calls == ["on_toggle"]   # 按住连发不重复触发，但照样吞掉
-    assert not v.on_key(49, 0, False)                          # 光按空格放行
-    assert not v.on_key(vi.ESC, 0, False)                      # 没在录音，Esc 放行
-    v.state = "recording"
-    assert v.on_key(vi.ESC, 0, False) and calls[-1] == "cancel"
+    v.capturing = None
+    v.on_tap_event(vi.TAP_TOGGLE, 49, FN)
+    v.on_tap_event(vi.TAP_CANCEL, vi.ESC, 0)
+    v.on_tap_event(vi.TAP_CAPTURE, 9, FN | SHIFT)              # 没在录制，忽略
+    assert calls == ["on_toggle", "cancel"]
     v.capturing = []
-    assert not v.on_key(vi.ESC, 0, False)                      # 录制时 Esc 交给对话框
-    assert v.on_key(9, FN | SHIFT, False) and v.capturing == ["fn+shift+v"]
+    v.on_tap_event(vi.TAP_CAPTURE, 123, FN)                     # 方向键不支持，接着等
+    assert v.capturing == []
+    v.on_tap_event(vi.TAP_CAPTURE, 9, FN | SHIFT)
+    v.on_tap_event(vi.TAP_CAPTURE, 0, FN)                       # 只收第一个
+    assert v.capturing == ["fn+shift+v"] and calls[-1] == "abort"
+
+
+def test_overlay_level_mapping():
+    from overlay import elapsed_label, level_to_height
+    assert level_to_height(0.0) == 0.0 and level_to_height(1.0) == 1.0
+    assert 0.3 < level_to_height(0.05) < 0.8                   # 正常说话落在中段
+    assert elapsed_label(7.9) == "0:07" and elapsed_label(125) == "2:05"
 
 
 def test_save_and_load_hotkey(tmp_path, monkeypatch):
