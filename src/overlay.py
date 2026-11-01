@@ -78,11 +78,11 @@ class OverlayView(NSView):
 
 
 class Overlay:
-    def __init__(self):
+    def __init__(self, level_source=lambda: 0.0):
         self.panel = None
         self.view = None
         self.timer = None
-        self.level = 0.0  # 录音回调线程写，绘制定时器读；单个 float 赋值不用加锁
+        self.level_source = level_source  # 返回当前音量（RMS），绘制定时器每帧取一次
 
     def build(self):
         self.panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
@@ -105,8 +105,10 @@ class Overlay:
         if self.panel is None:
             self.build()
         if not self.panel.isVisible():
-            screen = NSScreen.mainScreen().visibleFrame()  # 当前键盘焦点所在的屏幕
-            self.panel.setFrameOrigin_((screen.origin.x + (screen.size.width - W) / 2, screen.origin.y + BOTTOM_GAP))
+            main = NSScreen.mainScreen()  # 当前键盘焦点所在的屏幕；合盖外接屏切换的瞬间可能为空
+            if main is not None:
+                screen = main.visibleFrame()
+                self.panel.setFrameOrigin_((screen.origin.x + (screen.size.width - W) / 2, screen.origin.y + BOTTOM_GAP))
             self.view.levels = [0.0] * BARS
             self.panel.orderFrontRegardless()
         if mode != self.view.mode or self.timer is None:
@@ -118,7 +120,7 @@ class Overlay:
 
     def tick(self):
         if self.view.mode == "recording":
-            self.view.levels = self.view.levels[1:] + [level_to_height(self.level)]  # 新音量从右边进
+            self.view.levels = self.view.levels[1:] + [level_to_height(self.level_source())]  # 新音量从右边进
         self.view.setNeedsDisplay_(True)
 
     def hide(self):
@@ -127,4 +129,3 @@ class Overlay:
             self.timer = None
         if self.panel is not None:
             self.panel.orderOut_(None)
-        self.level = 0.0

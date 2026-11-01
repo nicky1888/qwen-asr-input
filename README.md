@@ -1,4 +1,4 @@
-当前版本 v10（2026-10-30）· 状态：键盘监听改成原生线程、录音浮条已实测；模型重载期间的按键延迟已实测，长时间日常使用待观察 · 待拍板：无
+当前版本 v11（2026-11-02）· 状态：修了停止录音时整个 App 卡死（PortAudio 死锁），录音换成原生 AudioQueue，录音和识别都加了超时复位；已在本机替换运行，30 项单元测试通过；真实口述与长时间稳定性待观察 · 待拍板：无
 
 # qwen-asr-input · 本地语音输入
 
@@ -99,7 +99,7 @@ scripts/voice-input run      # 前台运行，Ctrl+C 退出，调试用
 
 ## 文件
 
-- `src/voice_input.py`：主逻辑；`src/panel.py` + `src/panel.html`：控制面板（同进程 WKWebView，离线）；`src/stats.py`：日志统计；`src/i18n.py`：中英文切换；`src/cleanup.py`：语气词清理；`src/cn_numbers.py`：中文数字转阿拉伯数字；`src/keytap.c`：原生键盘监听，启动时按需用 clang 编译到 `out/libkeytap.dylib`（git 忽略）；`src/overlay.py`：录音浮条；`scripts/voice-input`：启停脚本。
+- `src/voice_input.py`：主逻辑；`src/panel.py` + `src/panel.html`：控制面板（同进程 WKWebView，离线）；`src/stats.py`：日志统计；`src/i18n.py`：中英文切换；`src/cleanup.py`：语气词清理；`src/cn_numbers.py`：中文数字转阿拉伯数字；`src/keytap.c`：原生键盘监听，启动时按需用 clang 编译到 `out/libkeytap.dylib`（git 忽略）；`src/audiorec.c`：原生 AudioQueue 录音，启动时按需编译到 `out/libaudiorec.dylib`（git 忽略）；`src/overlay.py`：录音浮条；`scripts/voice-input`：启停脚本。
 - `app/launcher.m`：Dock 启动器，几十行 Objective-C。它把 Python 主程序拉起来当子进程，权限因此算在 App 名下；运行中点 Dock 时，它通知主程序打开控制面板。`app/make_icon.py` 画图标。`scripts/build-app.sh` 编译、签名、装到 `~/Applications`，第一次运行时加进 Dock。
 - 模型：`data/models/`（git 忽略），来源和校验值见「模型」一节。
 - 依赖：`.venv`（Python 3.12，uv），精确版本见 `requirements.lock`。重建：`uv venv -p 3.12 .venv && uv pip install --python .venv/bin/python -r requirements.lock`。
@@ -116,7 +116,7 @@ scripts/voice-input run      # 前台运行，Ctrl+C 退出，调试用
 
 ## 测试
 
-- `.venv/bin/python -m pytest -q tests/test_units.py`：快捷键、设置、剪贴板恢复、词表、闲置卸载、日志统计、语言切换、语气词清理、数字转换、原生监听的吞键规则、浮条音量映射，共 20 个，不需要模型。
+- `.venv/bin/python -m pytest -q tests/test_units.py`：快捷键、设置、剪贴板恢复、词表、闲置卸载、日志统计、语言切换、语气词清理、数字转换、原生监听的吞键规则、浮条音量映射、原生录音缓冲区、分段识别、开麦失败与超时、识别看门狗及焦点检查，共 30 个，不需要模型权重；分段测试需要已安装的 qwen_asr 依赖。
 - `.venv/bin/python tests/bench.py`：无界面基准，测延迟、内存、连续 10 次、静音。样本在 `data/samples`（git 忽略）。
 - `tests/e2e_drive.py <wav>`：模拟按快捷键，外放样本让麦克风收音，再按一次结束。屏幕要解锁，并先把焦点放到目标输入框。
 

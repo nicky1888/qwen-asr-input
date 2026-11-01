@@ -1,21 +1,24 @@
 """Qwen3-ASR 本地语音输入：全局快捷键切换录音，识别后粘贴到原输入框。
 
-主线程跑 AppKit 事件循环（键盘监听、菜单栏、AX、剪贴板都在这里）；
-模型加载和识别在后台线程，结果用 callAfter 回主线程插入。
+主线程跑 AppKit 事件循环（菜单栏、AX、剪贴板都在这里），只做不会卡住的事；
+键盘监听和录音在原生线程（keytap.c、audiorec.c），开关麦、模型加载和识别在后台线程，
+结果用 callAfter 回主线程插入。后台的每一步都有超时，卡住了也只影响这一段，主线程照常响应。
 """
 import argparse
 import ctypes
+import functools
 import json
 import logging
 import os
+import queue
 import struct
 import subprocess
 import threading
 import time
+from concurrent.futures import Future
 from pathlib import Path
 
 import numpy as np
-import sounddevice as sd
 from AppKit import (
     NSAlert, NSApplication, NSApplicationActivationPolicyAccessory, NSColor, NSImage, NSMenu, NSMenuItem,
     NSPasteboard, NSPasteboardItem, NSPasteboardTypeString, NSSound,
@@ -24,7 +27,7 @@ from AppKit import (
 from ApplicationServices import (
     AXIsProcessTrustedWithOptions, AXUIElementCopyAttributeValue,
     AXUIElementCreateApplication, AXUIElementIsAttributeSettable,
-    AXUIElementSetAttributeValue, kAXTrustedCheckOptionPrompt,
+    AXUIElementCreateSystemWide, AXUIElementSetAttributeValue, AXUIElementSetMessagingTimeout, kAXTrustedCheckOptionPrompt,
 )
 from CoreFoundation import CFEqual
 from Foundation import (
@@ -59,6 +62,10 @@ PASTE_RESTORE_DELAY = 0.6  # 发出 ⌘V 后等目标 App 读完剪贴板再恢�
 DEFAULT_MAX_SECONDS = 120     # 单次录音上限；优先级：命令行显式传 > settings.json > 这个默认值
 DEFAULT_IDLE_UNLOAD_MIN = 10  # 闲置这么久卸下模型（约省 2GB），下次按快捷键边录边重载；0 表示常驻
 TEXT_ROLES = {"AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"}
+AX_TIMEOUT = 1.0         # 单次 AX 查询最多等这么久；系统默认 6 秒，目标 App 忙时会把主线程整个卡住
+MIC_TIMEOUT = 5.0        # 开麦、关麦最多等这么久，超了按麦克风卡住处理
+MODEL_WAIT_TIMEOUT = 60  # 识别前等模型重载的上限
+ASR_CHUNK_SEC = 60       # 长录音切成不超过这么长的段逐段识别：单段生成上限 1024 token，一整段 3 分钟以上会被截断
 
 # 菜单栏图标用 SF Symbols；录音时染红，其余跟随系统明暗
 ICONS = {"loading": "hourglass", "ready": "mic", "recording": "mic.fill", "transcribing": "waveform",
@@ -76,6 +83,8 @@ def load_asr(path):
     """加载到 MPS 并预热；返回 (model, 加载秒数, 预热秒数)。不回退 CPU。"""
     import torch
     from qwen_asr import Qwen3ASRModel
+    from transformers.utils import logging as hf_logging
+    hf_logging.set_verbosity_error()  # 每次识别都打一行无关的生成参数警告，刷满日志
     t0 = time.time()
     model = Qwen3ASRModel.from_pretrained(str(path), dtype=torch.bfloat16, device_map="mps", max_new_tokens=1024)
     if str(model.device) != "mps:0":
@@ -83,6 +92,24 @@ def load_asr(path):
     t1 = time.time()
     model.transcribe((np.random.default_rng(0).normal(0, 0.05, SR * 2).astype(np.float32), SR))
     return model, t1 - t0, time.time() - t1
+
+
+def transcribe_audio(model, audio, context):
+    """长录音先在低音量处切段，再逐段识别拼起来。"""
+    from qwen_asr.inference.utils import split_audio_into_chunks
+    parts = split_audio_into_chunks(wav=audio, sr=SR, max_chunk_sec=ASR_CHUNK_SEC)
+    texts = [model.transcribe((wav, SR), context=context)[0].text.strip() for wav, _ in parts]
+    return join_parts(texts)
+
+
+def join_parts(texts):
+    """分段结果拼接：两边都是英文字母或数字时补一个空格，中文直接接。"""
+    out = ""
+    for t in filter(None, texts):
+        if out and out[-1].isascii() and out[-1].isalnum() and t[0].isascii() and t[0].isalnum():
+            out += " "
+        out += t
+    return out
 
 
 def release_mps():
@@ -167,7 +194,9 @@ def load_hotkey():
 def save_setting(key, value):
     data = json.loads(SETTINGS_PATH.read_text()) if SETTINGS_PATH.exists() else {}
     data[key] = value
-    SETTINGS_PATH.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    tmp = SETTINGS_PATH.with_suffix(".tmp")  # 先写临时文件再替换：写到一半退出不会留下坏文件，下次照常启动
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n")
+    tmp.replace(SETTINGS_PATH)
 
 
 def save_hotkey(spec):
@@ -182,13 +211,17 @@ def mods_mask(mods):
     return sum(mask for name, _, mask in MOD_ORDER if name in mods)
 
 
+def build_native(src, out, framework):
+    """按需编译原生模块（源码比产物新才编），返回加载好的库。"""
+    if not out.exists() or out.stat().st_mtime < src.stat().st_mtime:
+        out.parent.mkdir(exist_ok=True)
+        subprocess.run(["clang", "-O2", "-Wall", "-dynamiclib", "-framework", framework,
+                        "-o", str(out), str(src)], check=True, capture_output=True)
+    return ctypes.CDLL(str(out))
+
+
 def load_keytap_lib():
-    """按需编译 keytap.c（源码比产物新才编），返回加载好的库。"""
-    if not KEYTAP_LIB.exists() or KEYTAP_LIB.stat().st_mtime < KEYTAP_SRC.stat().st_mtime:
-        KEYTAP_LIB.parent.mkdir(exist_ok=True)
-        subprocess.run(["clang", "-O2", "-Wall", "-dynamiclib", "-framework", "ApplicationServices",
-                        "-o", str(KEYTAP_LIB), str(KEYTAP_SRC)], check=True, capture_output=True)
-    lib = ctypes.CDLL(str(KEYTAP_LIB))
+    lib = build_native(KEYTAP_SRC, KEYTAP_LIB, "ApplicationServices")
     lib.kt_handle.argtypes = [ctypes.c_int, ctypes.c_int64, ctypes.c_uint64, ctypes.c_int]
     lib.kt_set_hotkey.argtypes = [ctypes.c_int64, ctypes.c_uint64]
     return lib
@@ -214,13 +247,20 @@ class KeyTap:
         threading.Thread(target=self.read_events, args=(r,), daemon=True, name="keytap").start()
 
     def read_events(self, fd):
+        buf = b""
         while True:
-            data = os.read(fd, TAP_RECORD.size * 64)  # 原生侧每条一次 write，读到的总是整条
-            for kind, code, flags in TAP_RECORD.iter_unpack(data):
+            try:
+                buf += os.read(fd, TAP_RECORD.size * 64)
+            except OSError:
+                log.exception("键盘事件管道读失败，快捷键失效，需要重启")
+                return
+            whole = len(buf) - len(buf) % TAP_RECORD.size  # 万一读到半条，留到下次拼上，别让这个线程崩掉
+            for kind, code, flags in TAP_RECORD.iter_unpack(buf[:whole]):
                 try:
                     self.on_event(kind, code, flags)
                 except Exception:
                     log.exception("处理键盘事件出错")
+            buf = buf[whole:]
 
     def set_hotkey(self, hotkey):
         code, mods = hotkey
@@ -235,6 +275,68 @@ class KeyTap:
             self.lib.kt_set_capturing(int(on))
 
 
+# ---------- 录音 ----------
+
+AUDIOREC_SRC = Path(__file__).resolve().parent / "audiorec.c"
+AUDIOREC_LIB = ROOT / "out/libaudiorec.dylib"
+
+
+def load_audiorec_lib():
+    lib = build_native(AUDIOREC_SRC, AUDIOREC_LIB, "AudioToolbox")
+    lib.ar_start.argtypes = [ctypes.c_double]
+    lib.ar_stop.restype = ctypes.c_size_t
+    lib.ar_copy.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.ar_copy.restype = ctypes.c_size_t
+    lib.ar_append.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+    lib.ar_level.restype = ctypes.c_float
+    lib.ar_blocks.restype = ctypes.c_uint64
+    return lib
+
+
+class Recorder:
+    """麦克风。采集在 audiorec.c 里；开麦关麦排进一个专用后台线程按顺序做，调用方拿 Future，主线程从不等。
+    线程是 daemon：真卡死在系统调用里也不拦着进程退出。"""
+
+    def __init__(self, lib=None):
+        self.lib = lib or load_audiorec_lib()
+        self.jobs = queue.Queue()
+        threading.Thread(target=self.run_jobs, daemon=True, name="mic").start()
+
+    def run_jobs(self):
+        while True:
+            fn, fut = self.jobs.get()
+            try:
+                fut.set_result(fn())
+            except Exception as e:
+                fut.set_exception(e)
+
+    def submit(self, fn):
+        fut = Future()
+        self.jobs.put((fn, fut))
+        return fut
+
+    def start(self):
+        def go():
+            err = self.lib.ar_start(float(SR))
+            if err:
+                raise RuntimeError(tr(f"系统录音接口报错 {err}（检查麦克风权限或输入设备）",
+                                      f"audio input error {err} (check microphone permission or input device)"))
+        return self.submit(go)
+
+    def stop(self):
+        """关麦，Future 的结果是录到的音频（float32 一维）。"""
+        def go():
+            n = self.lib.ar_stop()
+            audio = np.empty(n, np.float32)
+            n = self.lib.ar_copy(audio.ctypes.data, n)
+            self.lib.ar_reset()
+            return audio[:n]
+        return self.submit(go)
+
+    def level(self):
+        return self.lib.ar_level()
+
+
 # ---------- 目标输入框 ----------
 
 def ax_get(el, attr):
@@ -246,17 +348,19 @@ def capture_target():
     app = NSWorkspace.sharedWorkspace().frontmostApplication()
     pid = app.processIdentifier()
     if pid == os.getpid():  # 前台是本进程（控制面板）：主线程上 AX 查自己会卡到超时，deliver 会直接拦下
-        return {"pid": pid, "name": app.localizedName(), "ax_app": None, "focused": None}
+        return {"pid": pid, "name": app.localizedName(), "ax_app": None, "focused": None, "window": None}
+    t0 = time.time()
     ax_app = AXUIElementCreateApplication(pid)
     # Electron（Obsidian、Slack 等）默认不暴露 AX 树，打开它才能拿到焦点控件
     AXUIElementSetAttributeValue(ax_app, "AXManualAccessibility", True)
     focused = ax_get(ax_app, "AXFocusedUIElement")
-    for _ in range(3):  # 刚打开 AX 树时 Electron 要几十毫秒才给出焦点
-        if focused is not None:
+    for _ in range(3):  # 刚打开 AX 树时 Electron 要几十毫秒才给出焦点；目标 App 卡着就别再等
+        if focused is not None or time.time() - t0 > 0.3:
             break
         time.sleep(0.05)
         focused = ax_get(ax_app, "AXFocusedUIElement")
-    return {"pid": pid, "name": app.localizedName(), "ax_app": ax_app, "focused": focused}
+    window = ax_get(ax_app, "AXFocusedWindow") if focused is None else None
+    return {"pid": pid, "name": app.localizedName(), "ax_app": ax_app, "focused": focused, "window": window}
 
 
 def check_target(t):
@@ -265,11 +369,16 @@ def check_target(t):
     if now.processIdentifier() != t["pid"]:
         return tr(f"前台已从「{t['name']}」切到「{now.localizedName()}」",
                   f"switched from {t['name']} to {now.localizedName()}")
-    if t["focused"] is None:
-        return tr(f"拿不到「{t['name']}」的输入焦点", f"can't read the focused field in {t['name']}")
     cur = ax_get(t["ax_app"], "AXFocusedUIElement")
-    if cur is None or not CFEqual(cur, t["focused"]):
-        return tr("输入焦点已变化", "focused field changed")
+    if cur is None:
+        return tr(f"拿不到「{t['name']}」的输入焦点", f"can't read the focused field in {t['name']}")
+    if t["focused"] is not None:
+        if not CFEqual(cur, t["focused"]):
+            return tr("输入焦点已变化", "focused field changed")
+    else:  # 开录时没拿到焦点（Electron 刚打开 AX 树）：改用现在的焦点，但窗口必须还是开录时那个
+        win = ax_get(t["ax_app"], "AXFocusedWindow")
+        if t.get("window") is None or win is None or not CFEqual(win, t["window"]):
+            return tr(f"拿不到「{t['name']}」的输入焦点", f"can't read the focused field in {t['name']}")
     if _carbon.IsSecureEventInputEnabled() or ax_get(cur, "AXSubrole") == "AXSecureTextField":
         return tr("目标是密码框", "target is a password field")
     role = ax_get(cur, "AXRole")
@@ -330,6 +439,22 @@ def copy_text(text):
 
 # ---------- 主控 ----------
 
+class NoSound(Exception):
+    """录到的音频太短或全是静音。"""
+
+
+def guarded(fn):
+    """主线程入口兜底：出了异常记日志、关麦、回到就绪，不让状态卡在录音或识别中。"""
+    @functools.wraps(fn)
+    def wrapper(self, *args, **kwargs):
+        try:
+            return fn(self, *args, **kwargs)
+        except Exception as e:
+            log.exception("%s 出错", fn.__name__)
+            self.recover(tr(f"出错已复位：{e}", f"Reset after an error: {e}"))
+    return wrapper
+
+
 class MenuTarget(NSObject):
     def copyLast_(self, _):
         if self.app.last_text:
@@ -370,7 +495,8 @@ class VoiceInput:
     def __init__(self, args):
         self.args = args
         self.panel = Panel(self)
-        self.overlay = Overlay()
+        self.recorder = None  # start() 里建，原生模块编不出来时保持 None
+        self.overlay = Overlay(lambda: self.recorder.level() if self.recorder is not None else 0.0)
         self.model = None
         self.model_ready = threading.Event()  # 置位＝没有加载在进行；加载或重载期间清掉
         self.idle_unload = float(load_setting("idle_unload_minutes", DEFAULT_IDLE_UNLOAD_MIN))
@@ -378,8 +504,11 @@ class VoiceInput:
         self.digits = bool(load_setting("digits", True))    # 中文数字转阿拉伯数字，见 cn_numbers.py
         self.activity = 0  # 每回到就绪递增，让旧的闲置计时器作废
         self.state = None
-        self.chunks, self.stream, self.target = [], None, None
-        self.session = 0  # 每次录音递增，防止超时计时器误停下一次录音
+        self.target = None
+        self.session = 0  # 每段录音递增，复位时也递增：过期的计时器和晚到的识别结果靠它认出来
+        self.mic_on = False  # 本段开麦成功
+        self.rec_t0 = 0.0
+        self.asr_lock = threading.Lock()  # 复位后旧识别可能还在跑，新一段排在它后面，不并发用模型
         self.last_text = ""
         self.hotkey_spec = load_hotkey()
         self.hotkey = parse_hotkey(self.hotkey_spec)
@@ -416,6 +545,7 @@ class VoiceInput:
 
     def set_state(self, state, detail=None):
         self.state = state
+        self.keytap.set_recording(state == "recording")  # 放最前：后面界面更新出错，Esc 也不会被一直吞
         button = self.item.button()
         button.setImage_(NSImage.imageWithSystemSymbolName_accessibilityDescription_(ICONS[state], tr(*LABELS[state])))
         button.setContentTintColor_(NSColor.systemRedColor() if state == "recording" else None)
@@ -423,7 +553,6 @@ class VoiceInput:
         if detail is not None:
             self.detail_line.setTitle_(detail)
         log.info("state=%s %s", state, detail or "")
-        self.keytap.set_recording(state == "recording")
         if self.overlay is not None and state in ("recording", "transcribing"):
             self.overlay.show(state)
         elif self.overlay is not None:
@@ -516,6 +645,8 @@ class VoiceInput:
     def start(self):
         self.build_menu()
         self.set_state("loading", "")
+        # AX 查询的全局超时：系统默认 6 秒，目标 App 忙时会把主线程整个卡住
+        AXUIElementSetMessagingTimeout(AXUIElementCreateSystemWide(), AX_TIMEOUT)
         if not AXIsProcessTrustedWithOptions({kAXTrustedCheckOptionPrompt: True}):
             self.notify(tr("缺辅助功能权限：系统设置 → 隐私与安全性 → 辅助功能，勾上「语音输入」后从 Dock 重开（前台 run 时勾终端）",
                            "Accessibility permission missing: System Settings → Privacy & Security → Accessibility, "
@@ -524,6 +655,11 @@ class VoiceInput:
             self.keytap.start(self.hotkey)
         except RuntimeError as e:
             self.notify(str(e))
+        try:
+            self.recorder = Recorder()
+        except Exception as e:
+            log.exception("recorder load failed")
+            self.notify(tr(f"录音模块加载失败：{e}", f"Recorder failed to load: {e}"))
         threading.Thread(target=self.load_model, daemon=True).start()
 
     def load_model(self, reload=False):
@@ -604,12 +740,27 @@ class VoiceInput:
                      "回调超时" if flags == kCGEventTapDisabledByTimeout else "安全输入或权限变动")
 
     def quit(self):
-        self.stop_stream()
+        if self.recorder is not None:
+            self.recorder.stop()  # 排进录音线程就走，不等
         PID_PATH.unlink(missing_ok=True)
         log.info("quit")
         AppHelper.stopEventLoop()
 
     # 录音
+    def recover(self, detail):
+        """录音或识别中出了岔子：作废这一段、关麦、回到就绪。"""
+        if self.state not in ("recording", "transcribing"):
+            return
+        self.session += 1
+        if self.recorder is not None:
+            self.recorder.stop()
+        try:
+            self.set_state("ready", detail)
+            NSSound.soundNamed_("Basso").play()
+        except Exception:
+            log.exception("复位时出错")
+
+    @guarded
     def on_toggle(self):
         if self.state == "ready":
             self.start_recording()
@@ -617,83 +768,132 @@ class VoiceInput:
             self.finish_recording()
         elif self.state == "transcribing":
             self.notify(tr("还在识别上一段，稍等", "Still transcribing the last clip, please wait"))
+        elif self.state == "error" and self.model is None and self.model_ready.is_set():
+            self.model_ready.clear()  # 上次加载失败：按快捷键就重试，不用重启
+            self.set_state("loading", tr("重新加载模型", "Reloading model"))
+            threading.Thread(target=self.load_model, daemon=True).start()
         else:
             self.notify(tr(*LABELS[self.state]))
 
     def start_recording(self):
-        self.target = capture_target()
-        self.chunks = []
-        NSSound.soundNamed_("Tink").play()  # 先响再开麦，免得提示音录进去
-        try:
-            self.stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32",
-                                         callback=self.on_audio)
-            self.stream.start()
-        except Exception as e:
-            self.stream = None
-            log.exception("mic open failed")
-            self.notify(tr(f"打不开麦克风：{e}", f"Can't open the microphone: {e}"))
+        if self.recorder is None:
+            self.notify(tr("录音模块没加载，详情看日志", "Recorder failed to load, see log"))
             return
-        self.ensure_model()
+        self.target = capture_target()
+        NSSound.soundNamed_("Tink").play()  # 先响再开麦，免得提示音录进去
         self.session += 1
         session = self.session
+        self.mic_on, self.rec_t0 = False, time.time()
+        # 状态先切到录音，Esc 和再按快捷键立刻可用；开麦在录音线程里做，主线程不等
+        self.set_state("recording", tr(f"目标：{self.target['name']}", f"Target: {self.target['name']}"))
+        self.recorder.start().add_done_callback(
+            lambda f: AppHelper.callAfter(self.on_mic_started, session, f.exception()))
+        AppHelper.callLater(MIC_TIMEOUT, lambda: self.check_mic_started(session))
+        self.ensure_model()
         AppHelper.callLater(self.args.max_seconds, lambda: self.session == session and self.state == "recording"
                             and self.finish_recording(timed_out=True))
-        self.set_state("recording", tr(f"目标：{self.target['name']}", f"Target: {self.target['name']}"))
 
-    def on_audio(self, data, *_):
-        """录音线程里跑：存音频，顺手算音量给浮条画波形。"""
-        self.chunks.append(data.copy())
-        self.overlay.level = float(np.sqrt(np.mean(data * data)))
+    @guarded
+    def on_mic_started(self, session, err):
+        if session != self.session or self.state != "recording":
+            return  # 这段已经结束或取消；关麦请求排在开麦后面，会照常执行
+        if err is not None:
+            log.error("mic open failed: %s", err)
+            self.recover(tr(f"打不开麦克风：{err}", f"Can't open the microphone: {err}"))
+            return
+        self.mic_on = True
 
-    def stop_stream(self):
-        if self.stream is not None:
-            self.stream.stop()
-            self.stream.close()
-            self.stream = None
+    @guarded
+    def check_mic_started(self, session):
+        if session == self.session and self.state == "recording" and not self.mic_on:
+            log.error("mic not open after %.0fs", MIC_TIMEOUT)
+            self.recover(tr(f"麦克风 {MIC_TIMEOUT:.0f} 秒没打开，这段作废；连续出现就从菜单退出再重开",
+                            f"Microphone didn't open within {MIC_TIMEOUT:.0f}s; quit and reopen if it keeps happening"))
 
+    @guarded
     def cancel(self):
         if self.state != "recording":
             return
-        self.stop_stream()
-        self.chunks = []
+        self.session += 1
+        self.recorder.stop()
         self.set_state("ready", tr("已取消，未插入", "Cancelled, nothing inserted"))
         NSSound.soundNamed_("Pop").play()
 
+    @guarded
     def finish_recording(self, timed_out=False):
-        self.stop_stream()
         t_stop = time.time()
-        audio = np.concatenate(self.chunks)[:, 0] if self.chunks else np.zeros(0, np.float32)
-        self.chunks = []
-        secs = len(audio) / SR
-        if secs < 0.3 or np.abs(audio).max() < SILENCE_PEAK:
-            self.set_state("ready", tr("没录到声音（检查麦克风权限或输入设备）",
-                                       "No sound captured (check microphone permission or input device)"))
-            NSSound.soundNamed_("Basso").play()
-            return
+        wall = t_stop - self.rec_t0
+        session = self.session
+        audio_fut = self.recorder.stop()
         NSSound.soundNamed_("Pop").play()
-        self.set_state("transcribing", tr(f"{secs:.0f} 秒录音", f"{secs:.0f}s of audio")
+        self.set_state("transcribing", tr(f"{wall:.0f} 秒录音", f"{wall:.0f}s of audio")
                        + (tr("（已到时长上限自动结束）", " (stopped at the time limit)") if timed_out else ""))
-        threading.Thread(target=self.transcribe, args=(audio, secs, t_stop), daemon=True).start()
+        threading.Thread(target=self.transcribe, args=(session, audio_fut, wall, t_stop), daemon=True).start()
+        # 看门狗：正常识别约为录音时长的 7%，给足余量；超了就先把界面复位，别让人以为卡死
+        budget = 20 + 0.3 * wall + (0 if self.model is not None else MODEL_WAIT_TIMEOUT)
+        AppHelper.callLater(budget, lambda: self.check_transcribe(session, budget))
 
-    def transcribe(self, audio, secs, t_stop):
+    @guarded
+    def check_transcribe(self, session, budget):
+        if session == self.session and self.state == "transcribing":
+            log.error("transcribe watchdog fired after %.0fs", budget)
+            self.recover(tr(f"识别 {budget:.0f} 秒没出结果，先复位；结果晚到会放进「复制上次结果」。连续出现就从菜单退出再重开",
+                            f"No result after {budget:.0f}s, reset; a late result goes to Copy Last Result. "
+                            "Quit and reopen if it keeps happening"))
+
+    def transcribe(self, session, audio_fut, wall, t_stop):
+        """后台线程：等关麦拿到音频，再等模型，然后识别。每一步都有上限，结果交给 deliver。"""
+        text, err, secs = "", None, 0.0
         try:
-            self.model_ready.wait()
-            if self.model is None:
+            try:
+                audio = audio_fut.result(timeout=MIC_TIMEOUT)
+            except TimeoutError:
+                raise RuntimeError(tr(f"麦克风 {MIC_TIMEOUT:.0f} 秒没关上，这段录音丢了；从菜单退出再重开",
+                                      f"microphone didn't stop within {MIC_TIMEOUT:.0f}s, clip lost; quit and reopen"))
+            secs = len(audio) / SR
+            if secs < 0.3 or np.abs(audio).max() < SILENCE_PEAK:
+                raise NoSound()
+            if wall - secs > 2:  # 麦克风中途断流（多半是蓝牙耳机切换），录到的比按住的时间短
+                log.warning("mic gap wall=%.1fs audio=%.1fs", wall, secs)
+            if not self.model_ready.wait(MODEL_WAIT_TIMEOUT):
+                raise RuntimeError(tr(f"模型 {MODEL_WAIT_TIMEOUT} 秒没加载好，从菜单退出再重开",
+                                      f"model not loaded after {MODEL_WAIT_TIMEOUT}s, quit and reopen"))
+            model = self.model  # 拿住引用：识别途中就算被复位、闲置卸载，这一段也照样跑完
+            if model is None:
                 raise RuntimeError(tr("模型重载失败，详情看日志", "model reload failed, see log"))
-            text = self.model.transcribe((audio, SR), context=read_vocab())[0].text.strip()
+            with self.asr_lock:
+                text = transcribe_audio(model, audio, read_vocab())
             if self.cleanup:
                 raw_len, text = len(text), clean(text)
                 log.info("cleanup removed=%d chars", raw_len - len(text))  # 只记数量，不记内容
             if self.digits:
                 text = to_digits(text)
-            err = None
+        except NoSound as e:
+            err = e
         except Exception as e:
             log.exception("transcribe failed")
             text, err = "", e
-        release_mps()
-        AppHelper.callAfter(self.deliver, text, err, secs, t_stop, time.time())
+        try:
+            release_mps()
+        except Exception:
+            log.exception("release_mps failed")
+        AppHelper.callAfter(self.deliver, text, err, secs, t_stop, time.time(), session, wall)
 
-    def deliver(self, text, err, secs, t_stop, t_asr):
+    @guarded
+    def deliver(self, text, err, secs, t_stop, t_asr, session=None, wall=None):
+        if session is not None and (session != self.session or self.state != "transcribing"):
+            log.info("deliver late chars=%d", len(text))  # 看门狗已经复位过
+            if text:
+                self.last_text = text
+                self.notify(tr(f"上一段晚到的 {len(text)} 字没有插入，在菜单「复制上次结果」",
+                               f"A late result ({len(text)} chars) was not inserted; use Copy Last Result"),
+                            sound=None if self.state == "recording" else "Basso")  # 正在录新的一段，别把提示音录进去
+            return
+        if isinstance(err, NoSound):
+            self.set_state("ready", tr("没录到声音（检查麦克风权限或输入设备）",
+                                       "No sound captured (check microphone permission or input device)"))
+            NSSound.soundNamed_("Basso").play()
+            return
         if err is not None:
             self.set_state("ready", tr(f"识别失败：{err}", f"Transcription failed: {err}"))
             NSSound.soundNamed_("Basso").play()
@@ -701,11 +901,13 @@ class VoiceInput:
         if not text:
             self.set_state("ready", tr("没识别出文字", "No text recognized"))
             return
+        gap = tr(f"；录音中途断了约 {wall - secs:.0f} 秒", f"; mic dropped ~{wall - secs:.0f}s") \
+            if wall is not None and wall - secs > 2 else ""
         self.last_text = text
         reason = tr("目标是控制面板", "target is the control panel") if self.target["pid"] == os.getpid() else check_target(self.target)
         if reason:
             self.set_state("ready", tr(f"未插入：{reason}。结果在菜单「复制上次结果」",
-                                       f"Not inserted: {reason}. Use Copy Last Result"))
+                                       f"Not inserted: {reason}. Use Copy Last Result") + gap)
             NSSound.soundNamed_("Basso").play()
             log.info("deliver skipped audio=%.1fs asr=%.2fs chars=%d reason=%s", secs, t_asr - t_stop, len(text), reason)
             return
@@ -714,7 +916,7 @@ class VoiceInput:
         log.info("deliver ok app=%s audio=%.1fs asr=%.2fs stop_to_paste=%.2fs chars=%d",
                  self.target["name"], secs, t_asr - t_stop, t_done - t_stop, len(text))
         self.set_state("ready", tr(f"已插入 {len(text)} 字（{t_done - t_stop:.1f}s）",
-                                   f"Inserted {len(text)} chars ({t_done - t_stop:.1f}s)"))
+                                   f"Inserted {len(text)} chars ({t_done - t_stop:.1f}s)") + gap)
 
 
 def main():
@@ -728,9 +930,11 @@ def main():
         p.error(f"模型目录不对：{args.model}")
     if PID_PATH.exists():
         try:
-            os.kill(int(PID_PATH.read_text()), 0)
-            raise SystemExit(f"已经在运行（pid {PID_PATH.read_text().strip()}），先退出旧的")
-        except (ProcessLookupError, ValueError):
+            pid = int(PID_PATH.read_text())
+            cmd = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True).stdout
+            if "voice_input.py" in cmd:  # pid 可能被别的进程复用，只认本程序
+                raise SystemExit(f"已经在运行（pid {pid}），先退出旧的")
+        except ValueError:
             pass
     PID_PATH.write_text(str(os.getpid()))
     i18n.set_lang(load_setting("language", "zh"))
@@ -744,7 +948,13 @@ def main():
     voice = VoiceInput(args)
     voice.start()
     log.info("started pid=%d model=%s hotkey=%s", os.getpid(), args.model, voice.hotkey_spec)
-    AppHelper.runEventLoop(installInterrupt=True)
+    AppHelper.runEventLoop(installInterrupt=True, unexpectedErrorAlert=log_unexpected)
+
+
+def log_unexpected():
+    """事件循环里漏出来的异常：记日志接着跑。默认会弹一个模态框，本程序没有前台窗口，框藏在后面，看着就像卡死。"""
+    log.error("事件循环未处理的异常", exc_info=True)
+    return True
 
 
 if __name__ == "__main__":

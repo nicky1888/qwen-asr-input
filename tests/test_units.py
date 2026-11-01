@@ -310,3 +310,189 @@ def test_to_digits_converts_values_keeps_idioms():
                  "我有两个想法，一个是这样。", "七八个人", "五六十个", "一点点", "千万别忘了", "一刀切", "我们一块儿去",
                  "一日三餐", "两三天", "几十万", "第一"]:
         assert to_digits(keep) == keep, keep
+
+
+# ---------- 录音与识别流程（v11）----------
+
+def test_native_recorder_buffer_roundtrip():
+    # 不开麦，直接往原生缓冲区里喂数据，验证关麦后能完整拿回、拿完清空
+    import numpy as np
+    rec = vi.Recorder()
+    chunk = np.linspace(-0.5, 0.5, 800, dtype=np.float32)
+    for _ in range(3):
+        rec.lib.ar_append(chunk.ctypes.data, len(chunk))
+    assert 0.2 < rec.level() < 0.4                          # 最近一块的 RMS
+    audio = rec.stop().result(timeout=5)
+    assert len(audio) == 2400 and np.array_equal(audio[:800], chunk)
+    assert len(rec.stop().result(timeout=5)) == 0             # 拿完就清空，没在录时关麦也安全
+
+
+def test_join_parts_spaces_only_between_latin():
+    assert vi.join_parts(["今天开会。", "明天放假。"]) == "今天开会。明天放假。"
+    assert vi.join_parts(["we ship it", "next week"]) == "we ship it next week"
+    assert vi.join_parts(["用 Python", "写的"]) == "用 Python写的"
+    assert vi.join_parts(["", "好", ""]) == "好"
+
+
+def test_long_audio_is_split_before_transcribing():
+    import numpy as np
+    seen = []
+
+    class Model:
+        def transcribe(self, audio, context):
+            seen.append(len(audio[0]) / vi.SR)
+            return [type("R", (), {"text": f" 段{len(seen)} "})()]
+    audio = np.random.default_rng(0).normal(0, 0.05, vi.SR * 150).astype(np.float32)
+    assert vi.transcribe_audio(Model(), audio, "") == "段1段2段3"
+    # 切点在目标长度前后 5 秒内找低音量处，单段最长 65 秒，离 1024 token 上限很远
+    assert len(seen) == 3 and max(seen) <= vi.ASR_CHUNK_SEC + 5 and abs(sum(seen) - 150) < 1
+
+
+class FakeRecorder:
+    def __init__(self, audio=None, start_error=None):
+        from concurrent.futures import Future
+        self.audio, self.start_error, self.stops, self.Future = audio, start_error, 0, Future
+
+    def start(self):
+        f = self.Future()
+        f.set_exception(self.start_error) if self.start_error else f.set_result(None)
+        return f
+
+    def stop(self):
+        self.stops += 1
+        f = self.Future()
+        f.set_result(self.audio)
+        return f
+
+    def level(self):
+        return 0.0
+
+
+def make_flow(monkeypatch, recorder, model=None):
+    """不碰真麦克风、真 AX 和事件循环的 VoiceInput：计时器收进列表，callAfter 直接执行。"""
+    import numpy as np
+    timers, states, pasted = [], [], []
+    monkeypatch.setattr(vi.AppHelper, "callLater", lambda delay, f: timers.append((delay, f)))
+    monkeypatch.setattr(vi.AppHelper, "callAfter", lambda f, *a: f(*a))
+    monkeypatch.setattr(vi, "NSSound", type("S", (), {"soundNamed_": staticmethod(lambda n: type("P", (), {"play": lambda s: None})())}))
+    monkeypatch.setattr(vi, "capture_target", lambda: {"pid": 1, "name": "Notes", "ax_app": None, "focused": None})
+    monkeypatch.setattr(vi, "check_target", lambda t: None)
+    monkeypatch.setattr(vi, "paste_text", lambda t: pasted.append(t))
+    monkeypatch.setattr(vi, "release_mps", lambda: None)
+    monkeypatch.setattr(vi, "read_vocab", lambda: "")
+    monkeypatch.setattr(vi.threading, "Thread", lambda target, args=(), daemon=None, **kw:
+                        type("T", (), {"start": lambda s: target(*args)})())  # 后台线程改成当场跑完
+    v = vi.VoiceInput.__new__(vi.VoiceInput)
+    v.args = type("A", (), {"max_seconds": 120})()
+    v.recorder, v.model, v.model_ready = recorder, model, vi.threading.Event()
+    v.model_ready.set()
+    v.cleanup = v.digits = False
+    v.session, v.state, v.last_text, v.asr_lock = 0, "ready", "", vi.threading.Lock()
+    v.idle_unload = 0
+    v.ensure_model = lambda: None
+
+    def set_state(state, detail=None):
+        v.state = state
+        states.append((state, detail))
+    v.set_state = set_state
+    v.notify = lambda detail, sound=None: states.append(("notice", detail))
+    v._ = np
+    return v, timers, states, pasted
+
+
+def test_record_flow_pastes_text(monkeypatch):
+    import numpy as np
+    model = type("M", (), {"transcribe": lambda s, a, context: [type("R", (), {"text": "你好世界"})()]})()
+    rec = FakeRecorder(audio=np.full(vi.SR * 2, 0.1, np.float32))
+    v, timers, states, pasted = make_flow(monkeypatch, rec, model)
+    v.on_toggle()
+    assert v.state == "recording" and v.mic_on
+    v.rec_t0 -= 2
+    v.on_toggle()
+    assert pasted == ["你好世界"] and v.state == "ready" and rec.stops == 1
+    assert "录音中途断了" not in states[-1][1]
+
+
+def test_mic_open_failure_returns_to_ready(monkeypatch):
+    v, timers, states, pasted = make_flow(monkeypatch, FakeRecorder(start_error=RuntimeError("系统录音接口报错 -50")))
+    v.on_toggle()
+    assert v.state == "ready" and "打不开麦克风" in states[-1][1] and v.recorder.stops == 1
+
+
+def test_mic_start_timeout_resets(monkeypatch):
+    from concurrent.futures import Future
+    rec = FakeRecorder()
+    rec.start = lambda: Future()                        # 开麦一直不返回
+    v, timers, states, pasted = make_flow(monkeypatch, rec)
+    v.on_toggle()
+    assert v.state == "recording"
+    mic_check = next(f for d, f in timers if d == vi.MIC_TIMEOUT)
+    mic_check()
+    assert v.state == "ready" and "没打开" in states[-1][1] and rec.stops == 1   # 关麦请求已排在卡住的开麦后面
+    v.on_toggle()                                       # 复位后能马上开始下一段
+    assert v.state == "recording"
+
+
+def test_transcribe_watchdog_and_late_result(monkeypatch):
+    import numpy as np
+    v, timers, states, pasted = make_flow(monkeypatch, FakeRecorder(audio=np.full(vi.SR * 2, 0.1, np.float32)))
+    hold = []
+    v.transcribe = lambda *a: hold.append(a)            # 识别卡住：结果迟迟不回来
+    v.on_toggle()
+    v.on_toggle()
+    assert v.state == "transcribing"
+    watchdog = timers[-1][1]
+    watchdog()
+    assert v.state == "ready" and "没出结果" in states[-1][1]
+    session = hold[0][0]
+    v.deliver("晚到的字", None, 2.0, 0.0, 30.0, session, 2.0)   # 复位之后结果才到：不粘贴，留给复制
+    assert not pasted and v.last_text == "晚到的字" and "晚到" in states[-1][1]
+
+
+def test_silence_and_gap_messages(monkeypatch):
+    import numpy as np
+    model = type("M", (), {"transcribe": lambda s, a, context: [type("R", (), {"text": "好"})()]})()
+    v, timers, states, pasted = make_flow(monkeypatch, FakeRecorder(audio=np.zeros(vi.SR * 2, np.float32)), model)
+    v.on_toggle()
+    v.on_toggle()
+    assert v.state == "ready" and "没录到声音" in states[-1][1] and not pasted
+    v.recorder.audio = np.full(vi.SR * 2, 0.1, np.float32)   # 按了 10 秒只录到 2 秒：麦克风中途断流
+    v.on_toggle()
+    v.rec_t0 -= 10
+    v.on_toggle()
+    assert pasted == ["好"] and "录音中途断了" in states[-1][1]
+
+
+def test_guarded_resets_state_on_exception(monkeypatch):
+    v, timers, states, pasted = make_flow(monkeypatch, FakeRecorder())
+    v.on_toggle()
+    monkeypatch.setattr(vi, "NSSound", None)            # 结束录音时播放提示音抛异常
+    v.on_toggle()
+    assert v.state == "ready" and "出错已复位" in states[-1][1] and v.recorder.stops >= 1
+
+
+def test_check_target_accepts_focus_found_late(monkeypatch):
+    # 开录时 Electron 还没给出焦点（focused=None），插入时能读到可编辑输入框就照常粘贴
+    field, other = object(), object()
+    attrs = {"AXFocusedUIElement": field, "AXRole": "AXTextArea", "AXSubrole": None}
+    monkeypatch.setattr(vi, "ax_get", lambda el, a: attrs.get(a))
+    monkeypatch.setattr(vi, "CFEqual", lambda a, b: a is b)
+    monkeypatch.setattr(vi._carbon, "IsSecureEventInputEnabled", lambda: False)
+    monkeypatch.setattr(vi, "AXUIElementIsAttributeSettable", lambda el, a, _: (0, True))
+    front = type("App", (), {"processIdentifier": lambda s: 7, "localizedName": lambda s: "Grok"})()
+    monkeypatch.setattr(vi, "NSWorkspace", type("W", (), {"sharedWorkspace": staticmethod(
+        lambda: type("S", (), {"frontmostApplication": lambda s: front})())}))
+    win = object()
+    attrs["AXFocusedWindow"] = win
+    t = {"pid": 7, "name": "Grok", "ax_app": "app", "focused": None, "window": win}
+    assert vi.check_target(t) is None
+    attrs["AXFocusedWindow"] = object()                         # 同一 App 换了窗口：不贴
+    assert "拿不到" in vi.check_target(t)
+    assert "拿不到" in vi.check_target(dict(t, window=None))     # 开录时连窗口都没拿到：不贴
+    attrs["AXFocusedWindow"] = win
+    assert "变化" in vi.check_target(dict(t, focused=other))   # 开录时拿到过焦点、现在换了：照旧拦下
+    attrs["AXRole"] = "AXButton"
+    monkeypatch.setattr(vi, "AXUIElementIsAttributeSettable", lambda el, a, _: (0, False))
+    assert "可编辑" in vi.check_target(t)                        # 焦点不在输入框：照旧拦下
+    attrs["AXFocusedUIElement"] = None
+    assert "拿不到" in vi.check_target(t)

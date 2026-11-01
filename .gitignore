@@ -10,3 +10,6 @@ config/settings.json
 config/vocab.txt
 # 内部交接文档，含本机路径
 docs/*交接*
+
+# macOS 文件夹元数据
+.DS_Store
