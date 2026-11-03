@@ -359,7 +359,7 @@ def capture_target():
             break
         time.sleep(0.05)
         focused = ax_get(ax_app, "AXFocusedUIElement")
-    window = ax_get(ax_app, "AXFocusedWindow") if focused is None else None
+    window = ax_get(ax_app, "AXFocusedWindow")
     return {"pid": pid, "name": app.localizedName(), "ax_app": ax_app, "focused": focused, "window": window}
 
 
@@ -370,21 +370,24 @@ def check_target(t):
         return tr(f"前台已从「{t['name']}」切到「{now.localizedName()}」",
                   f"switched from {t['name']} to {now.localizedName()}")
     cur = ax_get(t["ax_app"], "AXFocusedUIElement")
-    if cur is None:
-        return tr(f"拿不到「{t['name']}」的输入焦点", f"can't read the focused field in {t['name']}")
-    if t["focused"] is not None:
+    fallback = cur is None or t["focused"] is None
+    if not fallback:
         if not CFEqual(cur, t["focused"]):
             return tr("输入焦点已变化", "focused field changed")
-    else:  # 开录时没拿到焦点（Electron 刚打开 AX 树）：改用现在的焦点，但窗口必须还是开录时那个
+    else:  # Electron 焦点不可读：能比较窗口就检查，否则以同一前台 App 降级放行
         win = ax_get(t["ax_app"], "AXFocusedWindow")
-        if t.get("window") is None or win is None or not CFEqual(win, t["window"]):
-            return tr(f"拿不到「{t['name']}」的输入焦点", f"can't read the focused field in {t['name']}")
-    if _carbon.IsSecureEventInputEnabled() or ax_get(cur, "AXSubrole") == "AXSecureTextField":
+        if t.get("window") is not None and win is not None and not CFEqual(win, t["window"]):
+            return tr("输入窗口已变化", "focused window changed")
+    field = cur if cur is not None else t["focused"]
+    if _carbon.IsSecureEventInputEnabled() or (field is not None and ax_get(field, "AXSubrole") == "AXSecureTextField"):
         return tr("目标是密码框", "target is a password field")
-    role = ax_get(cur, "AXRole")
-    err, settable = AXUIElementIsAttributeSettable(cur, "AXValue", None)
-    if role not in TEXT_ROLES and not (err == 0 and settable):
-        return tr(f"焦点不在可编辑区域（{role}）", f"focus is not an editable field ({role})")
+    if cur is not None:
+        role = ax_get(cur, "AXRole")
+        err, settable = AXUIElementIsAttributeSettable(cur, "AXValue", None)
+        if role not in TEXT_ROLES and not (err == 0 and settable):
+            return tr(f"焦点不在可编辑区域（{role}）", f"focus is not an editable field ({role})")
+    if fallback:
+        log.info("focus unreadable, fallback paste")
     return None
 
 

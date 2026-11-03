@@ -487,12 +487,59 @@ def test_check_target_accepts_focus_found_late(monkeypatch):
     t = {"pid": 7, "name": "Grok", "ax_app": "app", "focused": None, "window": win}
     assert vi.check_target(t) is None
     attrs["AXFocusedWindow"] = object()                         # 同一 App 换了窗口：不贴
-    assert "拿不到" in vi.check_target(t)
-    assert "拿不到" in vi.check_target(dict(t, window=None))     # 开录时连窗口都没拿到：不贴
+    assert "窗口已变化" in vi.check_target(t)
+    assert vi.check_target(dict(t, window=None)) is None        # 开录时窗口不可读：同一 App 降级放行
     attrs["AXFocusedWindow"] = win
     assert "变化" in vi.check_target(dict(t, focused=other))   # 开录时拿到过焦点、现在换了：照旧拦下
     attrs["AXRole"] = "AXButton"
     monkeypatch.setattr(vi, "AXUIElementIsAttributeSettable", lambda el, a, _: (0, False))
     assert "可编辑" in vi.check_target(t)                        # 焦点不在输入框：照旧拦下
     attrs["AXFocusedUIElement"] = None
-    assert "拿不到" in vi.check_target(t)
+    assert vi.check_target(t) is None
+
+
+@pytest.mark.parametrize("start_focus,cur_focus,start_win,cur_win,pid,secure,subrole,role,reason", [
+    (None, None, "win", "win", 7, False, None, "AXTextArea", None),
+    ("field", None, "win", "win", 7, False, None, "AXTextArea", None),
+    (None, "field", None, "win", 7, False, None, "AXTextArea", None),
+    (None, None, "win", None, 7, False, None, "AXTextArea", None),
+    (None, None, None, "win", 7, False, None, "AXTextArea", None),
+    (None, None, None, None, 7, False, None, "AXTextArea", None),
+    ("field", None, None, None, 7, False, None, "AXTextArea", None),
+    (None, "field", "win", None, 7, False, None, "AXTextArea", None),
+    (None, None, "win", "other", 7, False, None, "AXTextArea", "窗口已变化"),
+    ("field", None, "win", "other", 7, False, None, "AXTextArea", "窗口已变化"),
+    (None, None, None, None, 8, False, None, "AXTextArea", "前台已从"),
+    ("field", "other", None, None, 7, False, None, "AXTextArea", "焦点已变化"),
+    (None, None, None, None, 7, True, None, "AXTextArea", "密码框"),
+    (None, "field", None, None, 7, False, "AXSecureTextField", "AXTextField", "密码框"),
+    ("field", None, None, None, 7, False, "AXSecureTextField", "AXTextField", "密码框"),
+    (None, "field", None, None, 7, False, None, "AXButton", "可编辑"),
+    ("field", "field", None, None, 7, False, None, "AXTextArea", None),
+])
+def test_check_target_unreadable_focus_fallback(monkeypatch, caplog, start_focus, cur_focus,
+                                              start_win, cur_win, pid, secure, subrole, role, reason):
+    attrs = {"AXFocusedUIElement": cur_focus, "AXFocusedWindow": cur_win,
+             "AXSubrole": subrole, "AXRole": role}
+
+    def ax_get(el, attr):
+        assert el is not None  # 不向 AX 传入空焦点
+        return attrs.get(attr)
+
+    monkeypatch.setattr(vi, "ax_get", ax_get)
+    monkeypatch.setattr(vi, "CFEqual", lambda a, b: a == b)
+    monkeypatch.setattr(vi._carbon, "IsSecureEventInputEnabled", lambda: secure)
+    monkeypatch.setattr(vi, "AXUIElementIsAttributeSettable", lambda el, a, _: (0, False))
+    front = type("App", (), {"processIdentifier": lambda s: pid, "localizedName": lambda s: "Grok"})()
+    monkeypatch.setattr(vi, "NSWorkspace", type("W", (), {"sharedWorkspace": staticmethod(
+        lambda: type("S", (), {"frontmostApplication": lambda s: front})())}))
+    t = {"pid": 7, "name": "Grok", "ax_app": "app", "focused": start_focus, "window": start_win}
+    with caplog.at_level("INFO", logger="voice"):
+        result = vi.check_target(t)
+    if reason is None:
+        assert result is None
+    else:
+        assert reason in result
+    fallback = reason is None and (start_focus is None or cur_focus is None)
+    expected_logs = [("voice", 20, "focus unreadable, fallback paste")] if fallback else []
+    assert caplog.record_tuples == expected_logs
