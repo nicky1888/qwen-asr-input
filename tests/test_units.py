@@ -202,7 +202,9 @@ def test_phys_footprint_matches_footprint_cmd():
 
 def test_deliver_blocks_paste_into_own_panel(monkeypatch):
     states, pasted = [], []
+    copied = []
     monkeypatch.setattr(vi, "paste_text", lambda t: pasted.append(t))
+    monkeypatch.setattr(vi, "copy_text", lambda t: copied.append(t))
     monkeypatch.setattr(vi, "check_target", lambda t: pytest.fail("目标是本进程时不该走 AX 检查"))
     monkeypatch.setattr(vi, "NSSound", type("S", (), {"soundNamed_": staticmethod(lambda n: type("P", (), {"play": lambda s: None})())}))
     v = vi.VoiceInput.__new__(vi.VoiceInput)
@@ -210,6 +212,7 @@ def test_deliver_blocks_paste_into_own_panel(monkeypatch):
     v.set_state = lambda state, detail=None: states.append((state, detail))
     v.deliver("你好", None, 1.0, 0.0, 0.5)
     assert not pasted and v.last_text == "你好"           # 不粘，结果留给「复制上次结果」
+    assert copied == ["你好"]                              # 不粘时直接进剪贴板，⌘V 即可
     assert "目标是控制面板" in states[-1][1]
 
 

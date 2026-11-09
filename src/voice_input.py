@@ -888,8 +888,9 @@ class VoiceInput:
             log.info("deliver late chars=%d", len(text))  # 看门狗已经复位过
             if text:
                 self.last_text = text
-                self.notify(tr(f"上一段晚到的 {len(text)} 字没有插入，在菜单「复制上次结果」",
-                               f"A late result ({len(text)} chars) was not inserted; use Copy Last Result"),
+                copy_text(text)
+                self.notify(tr(f"上一段晚到的 {len(text)} 字没有插入，已复制到剪贴板，按 ⌘V 粘贴",
+                               f"A late result ({len(text)} chars) was not inserted; copied to clipboard, press ⌘V"),
                             sound=None if self.state == "recording" else "Basso")  # 正在录新的一段，别把提示音录进去
             return
         if isinstance(err, NoSound):
@@ -909,8 +910,9 @@ class VoiceInput:
         self.last_text = text
         reason = tr("目标是控制面板", "target is the control panel") if self.target["pid"] == os.getpid() else check_target(self.target)
         if reason:
-            self.set_state("ready", tr(f"未插入：{reason}。结果在菜单「复制上次结果」",
-                                       f"Not inserted: {reason}. Use Copy Last Result") + gap)
+            copy_text(text)  # 直接放进剪贴板，按 ⌘V 就能贴，不用再去菜单点「复制上次结果」
+            self.set_state("ready", tr(f"未插入：{reason}。已复制到剪贴板，按 ⌘V 粘贴",
+                                       f"Not inserted: {reason}. Copied to clipboard, press ⌘V") + gap)
             NSSound.soundNamed_("Basso").play()
             log.info("deliver skipped audio=%.1fs asr=%.2fs chars=%d reason=%s", secs, t_asr - t_stop, len(text), reason)
             return
